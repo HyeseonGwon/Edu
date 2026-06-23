@@ -24,3 +24,5 @@
 - 변경 사항을 diff로 미리 보고 Accept/Reject로 안전하게 적용할 수 있다.
 - VS Code 확장은 대부분 호환되지만, Agent·Rules 등 Cursor 전용 기능은 Cursor에서만 쓸 수 있다.
 - 구독 하나로 AI 기능이 묶여 있고, VS Code+클로드는 에디터와 AI 구독(API)을 따로 관리해야 한다.
+
+>추가 수정
