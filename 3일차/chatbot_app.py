@@ -1,5 +1,6 @@
 """OpenAI API + Streamlit 간단 챗봇 (3.2 OpenAI_API.ipynb 패턴 기반)."""
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -171,11 +172,13 @@ def chat_completion(
     messages: list[dict],
     temperature: float,
 ) -> str:
+    api_messages = copy.deepcopy(messages)
+
     while True:
         response = client.chat.completions.create(
             model=MODEL,
             temperature=temperature,
-            messages=messages,
+            messages=api_messages,
             tools=TOOLS,
         )
         msg = response.choices[0].message
@@ -183,7 +186,7 @@ def chat_completion(
         if not msg.tool_calls:
             return msg.content or ""
 
-        messages.append(msg.model_dump(exclude_none=True))
+        api_messages.append(msg.model_dump(exclude_none=True))
 
         for tc in msg.tool_calls:
             fn_name = tc.function.name
@@ -199,7 +202,7 @@ def chat_completion(
                 except Exception as exc:
                     result = json.dumps({"error": str(exc)}, ensure_ascii=False)
 
-            messages.append(
+            api_messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -245,8 +248,11 @@ def main() -> None:
     for message in st.session_state.messages:
         if message["role"] in ("system", "tool"):
             continue
+        content = message.get("content")
+        if not content:
+            continue
         with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+            st.markdown(content)
 
     if prompt := st.chat_input("메시지를 입력하세요"):
         st.session_state.messages.append({"role": "user", "content": prompt})
