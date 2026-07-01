@@ -1,0 +1,59 @@
+# =============================================================================
+# day4 Conda 환경 재현 파일
+# =============================================================================
+# 대상: 8일차/머신러닝 Day 1. 머신러닝 프로세스.ipynb
+# 기준: 현재 PC의 conda 환경 `day4` (Python 3.12.13)
+#
+# ── 방법 1) 이 파일로 환경 생성 (권장) ─────────────────────────────────────
+#   conda env create -f environment-day4.yml
+#   conda activate day4
+#   python -m ipykernel install --user --name day4 --display-name "Python (day4)"
+#   # Jupyter/Cursor에서 커널을 "Python (day4)" 로 선택 후 노트북 실행
+#
+# ── 방법 2) 이미 day4 환경이 있을 때 패키지만 맞추기 ─────────────────────────
+#   conda activate day4
+#   pip install -r requirements-day4-notebook.txt
+#
+# ── 방법 3) day4 전체를 그대로 복제 (LangChain·RAG 등 이전 실습 포함) ───────
+#   conda create -n day4 python=3.12 -y
+#   conda activate day4
+#   pip install -r requirements-day4-full.txt
+#   python -m ipykernel install --user --name day4 --display-name "Python (day4)"
+#
+# ── 환경 삭제 후 재설치 ─────────────────────────────────────────────────────
+#   conda deactivate
+#   conda env remove -n day4
+#   conda env create -f environment-day4.yml
+#
+# ── 기존 PC에서 환경 목록 갱신 (나중에 버전을 다시 맞출 때) ─────────────────
+#   conda activate day4
+#   pip freeze > requirements-day4-full.txt
+# =============================================================================
+
+name: day4
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      # Jupyter 노트북 커널
+      - ipykernel==7.3.0
+
+      # 데이터 처리 · 시각화
+      - pandas==3.0.3
+      - numpy==2.5.0
+      - matplotlib==3.11.0
+      - seaborn==0.13.2
+
+      # 머신러닝 (scikit-learn 패키지명: scikit-learn, import명: sklearn)
+      - scikit-learn==1.9.0
+      - scipy==1.18.0
+      - joblib==1.5.3
+      - threadpoolctl==3.6.0
+
+      # 부스팅 모델 (노트북 3장 모델링 섹션)
+      - xgboost==3.3.0
+      - lightgbm==4.6.0
+      - catboost==1.2.10
