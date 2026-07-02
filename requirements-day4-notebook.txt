@@ -1,0 +1,22 @@
+# =============================================================================
+# day4 — 8일차 머신러닝 노트북 전용 pip 패키지 목록
+# =============================================================================
+# 사용법:
+#   conda create -n day4 python=3.12 -y
+#   conda activate day4
+#   pip install -r requirements-day4-notebook.txt
+#   python -m ipykernel install --user --name day4 --display-name "Python (day4)"
+# =============================================================================
+
+ipykernel==7.3.0
+pandas==3.0.3
+numpy==2.5.0
+matplotlib==3.11.0
+seaborn==0.13.2
+scikit-learn==1.9.0
+scipy==1.18.0
+joblib==1.5.3
+threadpoolctl==3.6.0
+xgboost==3.3.0
+lightgbm==4.6.0
+catboost==1.2.10
