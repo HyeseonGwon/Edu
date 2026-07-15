@@ -5,7 +5,7 @@ tools.py
 
 여기 있는 도구는 아래와 같습니다.
 1) web_search_raw     : DuckDuckGo 로 일반 웹 검색 → 파이썬 리스트[dict] 반환 (후보군 탐색용)
-2) targeted_review_search : "식당명 + 조건 + site:blog.naver.com" 형태의 타겟 검색 → (리뷰 텍스트, 출처 URL) 반환 (심층 검증용)
+2) targeted_review_search : "식당명 + 조건 + site:blog.naver.com" 형태의 타겟 검색 → 개별 리뷰 결과 리스트[{title,body,href}] 반환 (심층 검증용)
 3) geocode_place      : 장소명/주소 → 위경도 (실패 시 지역 중심으로 '폴백') — 지도 중심 잡기용
 4) locate_place       : 장소를 '지역 반경 안에서 확실히' 찾을 때만 좌표 반환(아니면 None) — 정확한 핀용
                         (KAKAO_REST_API_KEY 가 있으면 카카오 로컬 검색으로 정확도↑, 없으면 Nominatim)
@@ -120,14 +120,16 @@ def web_search(query: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────
 def targeted_review_search(
     place_name: str, region: str, keyword: str, max_results: int = 4
-) -> tuple[str, str]:
-    """특정 장소에 대해 "조건 키워드"를 겨냥한 검색을 수행해 리뷰 텍스트를 모아 줍니다.
+) -> list[dict]:
+    """특정 장소에 대해 "조건 키워드"를 겨냥한 검색을 수행해 '개별 리뷰 결과'를 돌려줍니다.
 
     예) place_name='OO식당', keyword='어린이 메뉴'
         → 검색어: "OO식당" 어린이 메뉴 site:blog.naver.com
-        → 네이버 블로그 후기 스니펫들을 하나의 문자열로 합쳐 반환
+        → 네이버 블로그 후기 결과들을 [{title, body, href}, ...] 리스트로 반환
 
-    이 텍스트를 심층 검증 노드의 LLM이 읽고 '계단 유무 / 어린이·안매운 메뉴 유무'를 판단합니다.
+    상위(validate_place)는 이 리스트를 '번호 매긴' 근거로 LLM에 넘기고, LLM이 '판정에
+    실제로 사용한 리뷰의 번호'를 돌려주면 그 번호의 href 만 출처 링크로 씁니다.
+    → 근거(스니펫)와 링크(URL)가 항상 같은 글을 가리키도록 보장합니다.
 
     Args:
         place_name: 식당/숙소 이름.
@@ -136,9 +138,8 @@ def targeted_review_search(
         max_results: 검색 결과 수.
 
     Returns:
-        (근거 텍스트, 대표 출처 URL) 튜플.
-        - 근거 텍스트: 블로그/리뷰 스니펫을 합친 문자열. 근거를 못 찾으면 빈 문자열 "".
-        - 대표 출처 URL: '자세히 보기' 링크로 쓸 대표 근거 1건의 주소. 없으면 "".
+        [{"title", "body", "href"}, ...] 형태의 결과 리스트(중복 href 제거).
+        근거를 하나도 못 찾으면 빈 리스트 [].
     """
     # 1차 시도: 네이버 블로그를 겨냥한 검색 연산자(site:) 사용
     #  - 검색 연산자를 쓰면 후기가 풍부한 블로그 텍스트를 우선적으로 모을 수 있습니다.
@@ -151,27 +152,25 @@ def targeted_review_search(
         results = web_search_raw(fallback_query, max_results=max_results)
 
     if not results:
-        return "", ""  # 근거 없음 → 상위 노드가 '불확실'로 처리
+        return []  # 근거 없음 → 상위 노드가 '불확실'로 처리
 
-    # 제목 + 스니펫을 사람이 읽는 형태로 이어 붙임 (LLM 입력용)
-    snippets = []
+    # 결과를 표준화(중복 href 제거, 빈 항목 제외)해 '번호 매길 수 있는' 리스트로 정리.
+    #  - 순서를 그대로 유지해야 LLM 이 돌려준 번호를 그대로 URL 로 되돌릴 수 있습니다.
+    cleaned: list[dict] = []
+    seen_href: set[str] = set()
     for r in results:
-        line = f"- {r['title']}: {r['body']}"
-        snippets.append(line.strip())
-    joined = "\n".join(snippets)
-
-    # 대표 출처 URL 선정: 근거가 풍부한 네이버 블로그를 우선, 없으면 첫 결과의 URL.
-    source_url = ""
-    for r in results:
-        href = r.get("href") or ""
-        if "blog.naver.com" in href:
-            source_url = href
-            break
-    if not source_url:
-        source_url = results[0].get("href") or ""
-
-    # LLM 입력 토큰 낭비 방지를 위해 과도하게 길면 잘라냄
-    return joined[:2500], source_url
+        title = (r.get("title") or "").strip()
+        body = (r.get("body") or "").strip()
+        href = (r.get("href") or "").strip()
+        if not (title or body):
+            continue
+        dedup_key = href or title
+        if dedup_key in seen_href:
+            continue
+        seen_href.add(dedup_key)
+        # LLM 입력 토큰 낭비 방지를 위해 스니펫이 과도하게 길면 잘라냄
+        cleaned.append({"title": title[:200], "body": body[:500], "href": href})
+    return cleaned
 
 
 # ──────────────────────────────────────────────────────────────────────────

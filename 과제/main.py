@@ -75,6 +75,10 @@ class SessionData(BaseModel):
     search_tried: int = 0
     search_refill: int = 0
 
+    # 검색 영역 반경(km). 프런트 슬라이더로 설정하며, 지도 원 크기와 핀 판정 반경에
+    #  동일하게 쓰입니다. 기본 5km(도시 내 기준), 카카오 상한에 맞춰 1~20 으로 clamp.
+    search_radius_km: float = 5.0
+
     class Config:
         arbitrary_types_allowed = True  # BaseMessage 등 임의 타입 허용
 
@@ -114,6 +118,20 @@ class StepRequest(BaseModel):
 
     session_id: str = Field(description="세션 식별자(조건이 저장돼 있어야 함)")
     reset: bool = Field(default=False, description="True 면 이전 검색 누적을 비우고 새로 시작")
+    radius_km: float | None = Field(
+        default=None,
+        description="검색 영역 반경(km). 프런트 슬라이더 값(1~20). None 이면 기존 세션 값을 유지.",
+    )
+
+
+def _clamp_radius(value: float | None, fallback: float) -> float:
+    """반경 입력을 1~20km 로 안전하게 제한한다(프런트 값을 신뢰하지 않기 위한 서버측 방어)."""
+    if value is None:
+        return fallback
+    try:
+        return max(1.0, min(float(value), 20.0))
+    except (TypeError, ValueError):
+        return fallback
 
 
 class FinishRequest(BaseModel):
@@ -306,6 +324,10 @@ def search_step(req: StepRequest):
 
         requirements = session.requirements
 
+        # 프런트가 보낸 반경(1~20km)을 세션에 반영. 값이 없으면 기존 세션 값을 유지.
+        #  (검색 시작 전 슬라이더로 정해 두면, 첫 스텝의 reset 요청과 함께 전달됩니다.)
+        session.search_radius_km = _clamp_radius(req.radius_km, session.search_radius_km)
+
         # 새 검색 시작이면 이전 누적을 초기화
         if req.reset:
             session.reset_search()
@@ -342,6 +364,7 @@ def search_step(req: StepRequest):
                         target_count=REFILL_SIZE,
                         exclude_names=session.search_seen,
                         refill_index=session.search_refill,
+                        radius_km=session.search_radius_km,
                     )
                     session.search_refill += 1
                     for c in new_cands:
@@ -400,7 +423,9 @@ def search_step(req: StepRequest):
                 session.search_finalists = session.search_finalists[:TARGET_FINALISTS]
                 added = True
                 # 새로 추가됐을 때만 지도를 다시 그림 (기존 핀 좌표는 캐시 재사용)
-                session.map_html = build_map_html(requirements, session.search_finalists)
+                session.map_html = build_map_html(
+                    requirements, session.search_finalists, session.search_radius_km
+                )
 
         # 세션의 대표 결과(finalists)도 실시간 동기화 (다른 응답에서 그대로 사용)
         session.finalists = list(session.search_finalists)

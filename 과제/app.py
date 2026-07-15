@@ -18,7 +18,7 @@ app.py  (Frontend / Streamlit)
 실행 방법
 --------
     # 터미널 1 (백엔드)
-    uvicorn main:app --reload --port 8000
+    uvicorn main:app --reload --port 8000 
     # 터미널 2 (프런트)
     streamlit run app.py
 """
@@ -34,6 +34,8 @@ import streamlit.components.v1 as components
 # ──────────────────────────────────────────────────────────────────────────
 # 페이지 기본 설정 (넓은 레이아웃이어야 좌우 분할이 시원하게 보입니다)
 #  - 사이드바(설정/도움말)는 Streamlit 기본 '<<' 컨트롤로 접거나 펼칠 수 있습니다.
+#  ★ st.set_page_config 는 반드시 '첫 번째 Streamlit 명령'이어야 합니다.
+#    (그래서 아래 CSS 주입(st.markdown)은 이 호출 뒤에 둡니다.)
 # ──────────────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="대가족 여행 코디네이터",
@@ -41,6 +43,88 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# ──────────────────────────────────────────────────────────────────────────
+# 배경 CSS 주입 — 해변을 떠올리게 하는 시원한 여름 감성 그라디언트 배경.
+#  (반드시 set_page_config 뒤에서 호출해야 합니다.)
+# ──────────────────────────────────────────────────────────────────────────
+page_bg_img = """
+<style>
+/* 전체 앱 배경 설정 — 앱 전체를 감싸는 안정적인 testid 에 직접 적용 */
+[data-testid="stAppViewContainer"] {
+    background-image: linear-gradient(180deg, #FDFCFB 0%, #E2D1C3 30%, #4FACFE 70%, #00F2FE 100%);
+    background-attachment: fixed;
+    background-size: cover;
+}
+
+/* 상단 헤더(툴바)를 투명 처리해 배경 그라디언트가 위까지 이어져 보이게 함 */
+[data-testid="stHeader"] {
+    background: rgba(0, 0, 0, 0);
+}
+
+/* 사이드바 배경 설정 (옵션: 사이드바는 조금 더 차분하게) */
+[data-testid="stSidebar"] > div:first-child {
+    background-image: linear-gradient(180deg, #EDF2F4 0%, #CED4DA 100%);
+    background-attachment: fixed;
+    background-size: cover;
+}
+
+/* 콘텐츠 컨테이너(결과 리스트·대화창)는 '통째로 불투명한 흰색'으로 처리 →
+   중요한 추천/대화 정보가 배경에 묻히지 않도록 확실히 띄운다.
+   (이 앱에서 테두리 컨테이너는 최종 추천 박스와 대화 박스 두 곳뿐이다) */
+[data-testid="stVerticalBlockBorderWrapper"] {
+    background: #ffffff;
+    border: 1px solid rgba(18, 48, 61, 0.12);
+    border-radius: 14px;
+    box-shadow: 0 6px 20px rgba(18, 48, 61, 0.14);
+}
+
+/* 버튼('다시 찾아보기'·'그만 찾기'·'새 여행 계획 시작' 등):
+   반투명 흰 배경 + '진한 회색' 글자/테두리로 가독성 확보.
+   (primary 버튼의 흰 글자가 안 보이던 문제도 글자색을 진하게 잡아 해결) */
+.stButton > button {
+    background: rgba(255, 255, 255, 0.92) !important;
+    color: #1f2d34 !important;
+    border: 1px solid rgba(18, 48, 61, 0.35) !important;
+    font-weight: 600;
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+}
+/* 비활성 버튼도 완전히 흐려지지 않게 중간 회색으로 (가독성 유지) */
+.stButton > button:disabled {
+    background: rgba(255, 255, 255, 0.70) !important;
+    color: #55636b !important;
+    border: 1px solid rgba(18, 48, 61, 0.20) !important;
+}
+
+/* 검색 반경 슬라이더: 라벨/눈금/현재값 글자를 진한 회색으로
+   (그라디언트 위에 바로 놓여 기본 연회색 글자가 잘 안 보이던 문제 해결) */
+.stSlider [data-testid="stWidgetLabel"] p,
+[data-testid="stSliderTickBarMin"],
+[data-testid="stSliderTickBarMax"],
+[data-testid="stThumbValue"] {
+    color: #1f2d34 !important;
+    font-weight: 600;
+}
+
+/* 하단 채팅 입력 '바' 전체는 투명 처리 → 배경 그라디언트가 끊김 없이 이어지게 */
+[data-testid="stBottom"],
+[data-testid="stBottom"] > div,
+[data-testid="stBottomBlockContainer"] {
+    background: transparent !important;
+}
+
+/* 실제 입력 필드(pill)만 반투명 흰 배경으로 살짝 띄워 가독성 확보 */
+[data-testid="stChatInput"] {
+    background: rgba(255, 255, 255, 0.85);
+    border-radius: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.55);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+}
+</style>
+"""
+st.markdown(page_bg_img, unsafe_allow_html=True)
 
 DEFAULT_API = "http://127.0.0.1:8000"
 TARGET_FINALISTS = 5  # 목표 최종 후보 수(서버의 TARGET_FINALISTS 와 맞춤)
@@ -64,6 +148,7 @@ def _init_state():
     ss.setdefault("search_active", False)   # 검색 루프 진행 중인지
     ss.setdefault("search_stop", False)     # '그만 찾기' 요청 여부(버튼 콜백이 설정)
     ss.setdefault("search_step_idx", 0)     # 지금까지 실행한 스텝(후보 검증) 횟수
+    ss.setdefault("search_radius_km", 5)    # 검색 영역 반경(km) 기본값 — 도시 내 기준 5km
 
 
 _init_state()
@@ -180,6 +265,22 @@ def _request_stop():
     st.session_state.search_stop = True
 
 
+def _restart_search():
+    """'다시 찾아보기' 버튼 콜백 — 현재 반경으로 검색을 처음부터 다시 실행한다.
+
+    지역에 결과가 드물 때 반경을 넓혀 재검색하는 용도. 조건(requirements)은 그대로 두고
+    누적 결과만 비운 뒤 검색 루프를 재시작합니다. (첫 스텝이 reset=True 로 서버 누적도 초기화)
+    """
+    ss = st.session_state
+    if not ss.session_id or not ss.requirements:
+        return  # 아직 검색할 조건이 없으면 무시
+    ss.search_active = True
+    ss.search_stop = False
+    ss.search_step_idx = 0
+    ss.finalists = []
+    ss.map_html = ""
+
+
 def _call_step(reset: bool, status) -> dict | None:
     """/search/step 을 스트리밍 호출해 진행 문구를 status 에 실시간 표시하고 결과를 반환."""
     ss = st.session_state
@@ -187,7 +288,11 @@ def _call_step(reset: bool, status) -> dict | None:
     try:
         with requests.post(
             f"{ss.api_base}/search/step",
-            json={"session_id": ss.session_id, "reset": reset},
+            json={
+                "session_id": ss.session_id,
+                "reset": reset,
+                "radius_km": ss.search_radius_km,
+            },
             stream=True,
             timeout=180,
         ) as resp:
@@ -375,10 +480,10 @@ with st.sidebar:
     st.caption(
         "- 부모님·아기와 함께 서울 송파구에서 점심 먹을 식당 찾아줘\n"
         "- 휠체어 타는 할머니랑 강남에서 안 매운 밥집\n"
-        "- 유모차 끌고 갈 수 있는 성수동 카페 추천"
+        "- 유모차 끌고 갈 수 있는 서울 성수동 카페 추천"
     )
     st.divider()
-    st.caption("Tech: LangGraph · FastAPI · Streamlit · Folium")
+    st.caption("Tech: Streamlit · FastAPI · LangGraph · Folium · Kakao Local · Nominatim · DuckDuckGo.")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -392,8 +497,34 @@ search_panel = st.empty()
 
 # ══════════════════════════════════════════════════════════════════════════
 # [상단] 추천 결과 — 왼쪽: 지도 / 오른쪽: 업체 리스트(스크롤)
+#  헤더 우측에 '검색 반경' 슬라이더 + '다시 찾아보기' 버튼을 둡니다.
+#   (지역에 결과가 드물 때 반경을 넓혀 즉시 재검색하는 흐름을 위해)
 # ══════════════════════════════════════════════════════════════════════════
-st.subheader("🗺️ 추천 결과")
+head_title, head_radius, head_btn = st.columns([4, 3, 2], gap="small", vertical_alignment="bottom")
+with head_title:
+    st.subheader("🗺️ 추천 결과")
+with head_radius:
+    st.session_state.search_radius_km = st.slider(
+        "🔍 검색 반경 (km)",
+        min_value=1,
+        max_value=20,
+        value=int(st.session_state.search_radius_km),
+        step=1,
+        help="지역에 결과가 드물면 반경을 넓힌 뒤 오른쪽 '다시 찾아보기'를 눌러 주세요. (최대 20km)",
+        disabled=st.session_state.search_active,
+    )
+with head_btn:
+    st.button(
+        "🔎 다시 찾아보기",
+        on_click=_restart_search,
+        use_container_width=True,
+        disabled=(
+            st.session_state.search_active
+            or not st.session_state.session_id
+            or not st.session_state.requirements
+        ),
+        help="현재 반경으로 후보를 처음부터 다시 찾습니다.",
+    )
 
 # 조건 수집 현황을 한 줄로 요약 (공간 절약)
 req = st.session_state.requirements
@@ -440,7 +571,7 @@ chat_box = st.container(height=260, border=True)
 with chat_box:
     if not st.session_state.messages:
         st.chat_message("assistant").write(
-            "안녕하세요! 3세대 가족 여행을 도와드릴게요.\n\n"
+            "안녕하세요! 다양한 가족과 함께하는 여정을 도와드릴게요.\n\n"
             "**① 누구와 · ② 무엇을(식당) · ③ 어디로** 를 알려주시면, "
             "조건을 모두 통과한 곳을 하나씩 찾아 지도에 올려 드려요."
         )

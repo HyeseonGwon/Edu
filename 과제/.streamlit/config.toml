@@ -1,0 +1,9 @@
+# Streamlit 테마 설정 — '시원한 여름' 그라디언트 배경과 어울리는 라이트 테마.
+#  (app.py 의 배경 CSS 는 이 테마 위에 그라디언트를 덧입힙니다.)
+[theme]
+base = "light"
+primaryColor = "#4FACFE"              # 버튼·슬라이더 강조색 (시원한 하늘색)
+backgroundColor = "#FDFCFB"           # 기본 배경 (그라디언트가 위에 깔림)
+secondaryBackgroundColor = "#EAF4FB"  # 위젯/컨테이너 기본 배경 (연한 하늘)
+textColor = "#12303D"                 # 텍스트 (진한 남색 계열 — 밝은 배경에서 가독성)
+font = "sans serif"
