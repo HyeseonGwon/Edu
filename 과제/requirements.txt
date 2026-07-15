@@ -1,0 +1,24 @@
+# 3세대 맞춤형 가족 여행 코디네이터 - 의존성
+# (day4 conda 환경 기준으로 검증된 조합입니다. 필요 시 최신 버전으로 올려도 됩니다.)
+
+# --- Agent / LLM ---
+langgraph>=1.2
+langchain>=1.3
+langchain-openai>=1.3
+langchain-community>=0.4
+openai>=2.0
+pydantic>=2.9
+
+# --- Tools (검색) ---
+ddgs>=9.0            # DuckDuckGo 검색 (구버전은 duckduckgo-search)
+requests>=2.31       # Nominatim 지오코딩 호출용
+
+# --- Backend ---
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-dotenv>=1.0
+
+# --- Frontend / Map ---
+streamlit>=1.36
+folium>=0.17
+streamlit-folium>=0.20   # (선택) 지도를 클라이언트에서 다룰 때 사용
