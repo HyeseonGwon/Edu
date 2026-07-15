@@ -25,11 +25,32 @@ app.py  (Frontend / Streamlit)
 
 from __future__ import annotations
 
+import base64
 import json
+import os
 
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
+
+
+@st.cache_data(show_spinner=False)
+def _bg_data_uri(path: str) -> str | None:
+    """배경 이미지 파일을 data URI(base64)로 인코딩한다. 없으면 None.
+
+    - 매 재실행마다 파일을 다시 읽고 인코딩하지 않도록 캐시한다.
+    - 확장자에 맞춰 MIME 타입을 정한다(png/jpg/webp).
+    """
+    if not os.path.exists(path):
+        return None
+    ext = os.path.splitext(path)[1].lower()
+    mime = (
+        "image/jpeg" if ext in (".jpg", ".jpeg")
+        else "image/webp" if ext == ".webp"
+        else "image/png"
+    )
+    with open(path, "rb") as f:
+        return f"data:{mime};base64," + base64.b64encode(f.read()).decode()
 
 # ──────────────────────────────────────────────────────────────────────────
 # 페이지 기본 설정 (넓은 레이아웃이어야 좌우 분할이 시원하게 보입니다)
@@ -125,6 +146,27 @@ page_bg_img = """
 </style>
 """
 st.markdown(page_bg_img, unsafe_allow_html=True)
+
+# ──────────────────────────────────────────────────────────────────────────
+# 배경 '사진' 얹기 — summer_bg.png 가 있으면 위 그라디언트 대신 사진을 배경으로.
+#  - 파일이 없으면 위 그라디언트가 그대로 폴백으로 유지됩니다.
+#  - 나중에 선언된 규칙이라 그라디언트 background-image 를 덮어씁니다.
+# ──────────────────────────────────────────────────────────────────────────
+_bg_uri = _bg_data_uri(os.path.join(os.path.dirname(__file__), "summer_bg.png"))
+if _bg_uri:
+    st.markdown(
+        f"""
+<style>
+[data-testid="stAppViewContainer"] {{
+    background-image: url("{_bg_uri}");
+    background-size: cover;
+    background-position: center;
+    background-attachment: fixed;
+}}
+</style>
+""",
+        unsafe_allow_html=True,
+    )
 
 DEFAULT_API = "http://127.0.0.1:8000"
 TARGET_FINALISTS = 5  # 목표 최종 후보 수(서버의 TARGET_FINALISTS 와 맞춤)
@@ -438,12 +480,17 @@ def render_finalist_list():
         for i, p in enumerate(finalists, 1):
             # 지도에 핀이 찍혔는지(정확한 위치 확인 여부)를 제목 배지로 함께 표시
             pin_badge = "📍 지도 표시" if p.get("located") else "🗺️ 위치 미확인"
+            # 사용자가 원한 메뉴를 파는 근거가 있으면 '메뉴 일치' 뱃지를 덧붙임(선택 조건)
+            menu_badge = "  ·  🍽️ 메뉴 일치" if p.get("menu_match") else ""
             with st.expander(
-                f"{i}. {p.get('name','(이름 미상)')}  ·  🟢 통과  ·  {pin_badge}", expanded=(i == 1)
+                f"{i}. {p.get('name','(이름 미상)')}  ·  🟢 통과  ·  {pin_badge}{menu_badge}",
+                expanded=(i == 1),
             ):
                 st.write(f"**분류**: {p.get('category') or '장소'}")
                 if p.get("address"):
                     st.write(f"**위치**: {p['address']}")
+                if p.get("menu_match") and req.get("menu"):
+                    st.write(f"**메뉴**: '{req.get('menu')}' 취급 언급 있음 🍽️")
                 if not p.get("located"):
                     st.caption("↳ 정확한 좌표를 확인하지 못해 지도에는 핀을 표시하지 않았어요. (상호명으로 직접 검색해 확인해 주세요)")
 
@@ -483,7 +530,7 @@ with st.sidebar:
         "- 유모차 끌고 갈 수 있는 서울 성수동 카페 추천"
     )
     st.divider()
-    st.caption("Tech: Streamlit · FastAPI · LangGraph · Folium · Kakao Local · Nominatim · DuckDuckGo.")
+    st.caption("Streamlit · FastAPI · LangGraph · Folium · Kakao Local · Nominatim · DuckDuckGo.")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -529,13 +576,15 @@ with head_btn:
 # 조건 수집 현황을 한 줄로 요약 (공간 절약)
 req = st.session_state.requirements
 if req:
-    line = "　·　".join(
-        [
-            f"**누구와** {req.get('companions') or '미정'}",
-            f"**무엇을** {req.get('place_type') or '미정'}",
-            f"**어디로** {req.get('region') or '미정'}",
-        ]
-    )
+    parts = [
+        f"**누구와** {req.get('companions') or '미정'}",
+        f"**무엇을** {req.get('place_type') or '미정'}",
+        f"**어디로** {req.get('region') or '미정'}",
+    ]
+    # 메뉴는 선택 조건 — 있을 때만 표시
+    if req.get("menu"):
+        parts.append(f"**메뉴** {req.get('menu')}")
+    line = "　·　".join(parts)
     flags = []
     if req.get("need_no_stairs"):
         flags.append("♿ 계단 적은 곳")

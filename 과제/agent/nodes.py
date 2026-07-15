@@ -151,6 +151,13 @@ class CollectResult(BaseModel):
             "근거가 전혀 없으면 빈 문자열."
         ),
     )
+    menu: str = Field(
+        default="",
+        description=(
+            "사용자가 먹고 싶다고 말한 '메뉴/음식 종류'(식당일 때만, 예: 삼겹살·파스타·국밥). "
+            "선택 조건이라 말하지 않으면 빈 문자열. 지역·식당유형과 혼동하지 말 것."
+        ),
+    )
     region: str = Field(
         default="",
         description=(
@@ -196,6 +203,8 @@ STATE_MANAGER_SYSTEM = (
     "- '무엇을(place_type)'은 사용자가 식당/밥/식사/맛집/카페 또는 숙소/호텔/펜션 등을 '명시'하면 채웁니다. "
     "명시하지 않았어도 문맥상 분명히 추론되면 채우세요 "
     "(예: '배고프다/밥/맛집' → '식당', '떠나고싶다/쉬고싶다/자고싶다/1박' → '숙소').\n"
+    "- 사용자가 먹고 싶은 '메뉴/음식'을 말하면 menu 에 적으세요(예: '삼겹살', '파스타', '국밥'). "
+    "menu 는 '식당'일 때만 의미 있는 '선택' 조건이라, 말하지 않으면 빈 문자열로 두고 절대 되묻지 마세요.\n"
     "- '어디로(region)'는 더 엄밀합니다. 사용자가 '실제 지명'을 직접 말했을 때만 region 을 채우고, "
     "지명이 없으면 region 은 반드시 빈 문자열로 두세요('배고프다' 같은 말에는 지역이 없습니다).\n"
     "- 다만 사용자가 랜드마크·명소를 말해 지역이 추론되면, region 이 아니라 region_guess 에 그 지역을 적으세요 "
@@ -270,6 +279,7 @@ def state_manager_node(state: FamilyTripState) -> dict:
             f"- 누구와: {prev.companions or '(미정)'}\n"
             f"- 무엇을: {prev.place_type or '(미정)'}\n"
             f"- 어디로: {prev.region or '(미정)'}\n"
+            f"- 메뉴(선택): {prev.menu or '(없음)'}\n"
             f"- 계단조건 필요: {prev.need_no_stairs}, 아이메뉴 필요: {prev.need_kid_friendly}\n"
         )
 
@@ -300,10 +310,15 @@ def state_manager_node(state: FamilyTripState) -> dict:
     #  랜드마크로 추론된 지역은 region_guess(제안·확인용), 미정 의사는 region_undecided(추천용) 로 받는다.
     region_guess = (result.region_guess or "").strip()
     region_undecided = bool(result.region_undecided)
+    # 메뉴는 '식당'일 때만 의미 있는 선택 조건. 숙소 등에는 담지 않는다.
+    menu = (result.menu or "").strip()
+    if place_type != "식당":
+        menu = ""
     requirements = TripRequirements(
         companions=companions,
         place_type=place_type,
         region=region,
+        menu=menu,
         need_no_stairs=result.need_no_stairs,
         need_kid_friendly=result.need_kid_friendly,
         extra_notes=result.extra_notes,
@@ -372,6 +387,10 @@ class _CandidateItem(BaseModel):
     in_region: bool = Field(
         default=False,
         description="이 가게가 사용자가 찾는 '그 지역'에 실제로 위치한다는 근거가 스니펫에 있으면 True",
+    )
+    menu_match: bool = Field(
+        default=False,
+        description="사용자가 원한 특정 '메뉴'를 이 가게가 판다는 근거가 스니펫에 있으면 True. 메뉴 조건이 없으면 False",
     )
 
 
@@ -452,6 +471,11 @@ def search_candidates(
     exclude_names = exclude_names or set()
     place_type = req.place_type or "식당"
     region = req.region or "서울"
+    # 메뉴는 '식당'을 검색할 때 쓰는 '선택' 조건. 있으면 검색어를 그 메뉴로 좁히고, 없으면 무시.
+    menu = (getattr(req, "menu", "") or "").strip()
+    menu_on = bool(menu) and "식당" in place_type
+    #  검색어에 넣을 음식 표현: 메뉴가 있으면 메뉴로(예: '삼겹살 맛집'), 없으면 일반 유형으로('식당 맛집').
+    query_term = menu if menu_on else place_type
     radius_km = max(1.0, min(float(radius_km), 20.0))
     center = _region_center(region)
     kakao_on = bool(os.getenv("KAKAO_REST_API_KEY"))
@@ -460,13 +484,13 @@ def search_candidates(
     #  - 예: 0회차 → 0~3번, 1회차 → 2~5번 ... 겹치며 이동해 새 결과를 유도
     start = (refill_index * 2) % len(QUERY_TEMPLATES)
     picked = [QUERY_TEMPLATES[(start + k) % len(QUERY_TEMPLATES)] for k in range(4)]
-    queries = [t.format(region=region, pt=place_type) for t in picked]
+    queries = [t.format(region=region, pt=query_term) for t in picked]
 
     # 반경이 넓으면 '인접 지역' 검색어를 덧붙여 후보 발굴 범위를 넓힙니다.
     n_nearby = _nearby_query_count(radius_km)
     for k in range(n_nearby):
         tmpl = NEARBY_QUERY_TEMPLATES[(refill_index + k) % len(NEARBY_QUERY_TEMPLATES)]
-        queries.append(tmpl.format(region=region, pt=place_type))
+        queries.append(tmpl.format(region=region, pt=query_term))
 
     raw_snippets: list[str] = []
     for q in queries:
@@ -498,9 +522,17 @@ def search_candidates(
             "지역이 불분명하거나 다른 지역(타 도시·캠핑장·여행지 등)으로 보이면 제외하세요.\n"
         )
 
+    menu_line = f" 특히 '{menu}' 메뉴를 원합니다." if menu_on else ""
+    menu_rule = (
+        f"\n6. 가능하면 '{menu}'를 파는 곳 위주로 고르세요(선택 조건). "
+        "단, 위 1번대로 '상호명'만 추출하는 규칙은 그대로 지키세요.\n"
+        f"7. 스니펫에 그 가게가 '{menu}'를 판다는(또는 대표/전문으로 다룬다는) 근거가 보이면 "
+        "menu_match=true, 근거가 없으면 menu_match=false 로 표시하세요."
+        if menu_on else ""
+    )
     system = (
         "당신은 웹 검색 스니펫에서 '실제 존재하는 가게의 상호명'만 정확히 골라내는 정리 도우미입니다.\n"
-        f"사용자는 '{region}' 중심 반경 약 {radius_km:.0f}km 이내의 '{place_type}'를 찾고 있습니다.\n\n"
+        f"사용자는 '{region}' 중심 반경 약 {radius_km:.0f}km 이내의 '{place_type}'를 찾고 있습니다.{menu_line}\n\n"
         "[반드시 지켜야 할 규칙]\n"
         "1. '상호명(간판 이름)'만 추출하세요. 메뉴·음식 이름은 상호명이 아닙니다.\n"
         "   - 메뉴/음식(잘못된 예): '치즈닭갈비', '우대갈비', '마라탕', '한우오마카세', '파스타'\n"
@@ -509,7 +541,9 @@ def search_candidates(
         + region_rule
         + "3. 블로그/뉴스 '제목'이나 홍보 문구, 리스트 글 제목을 상호명으로 착각하지 마세요.\n"
         f"4. 같은 곳은 한 번만. 이름이 불분명하면 제외. 최대 {target_count}곳.\n"
-        "5. address 에는 스니펫에서 확인되는 주소/위치를 적으세요. 없으면 빈 값." + exclude_hint
+        "5. address 에는 스니펫에서 확인되는 주소/위치를 적으세요. 없으면 빈 값."
+        + menu_rule
+        + exclude_hint
     )
     try:
         extracted: CandidateList = candidate_extractor.invoke(
@@ -520,6 +554,7 @@ def search_candidates(
                         f"[검색 스니펫]\n{snippet_text}\n\n"
                         f"위에서 '{region}' 중심 반경 약 {radius_km:.0f}km 이내의 '{place_type}' 상호명만 추출하세요. "
                         "메뉴·음식 이름과 명백히 먼 다른 지역 가게는 제외하세요."
+                        + (f" 가능하면 '{menu}'를 파는 곳 위주로 골라 주세요." if menu_on else "")
                     )
                 ),
             ]
@@ -528,10 +563,18 @@ def search_candidates(
         print("[search_candidates] 후보 추출 실패:", e)
         return []
 
+    # (B) 소프트 우선정렬: 메뉴가 지정된 경우 '메뉴 일치' 후보를 이번 배치의 앞쪽으로 보냅니다.
+    #     - 전역 랭킹이 아니라 '이번 리필 배치 안에서만' 순서를 살짝 편향합니다.
+    #     - 안정 정렬이라 같은 그룹 안에서는 LLM 이 준 원래 순서를 그대로 유지합니다.
+    #     → 앞쪽 후보가 먼저 검증·스트리밍되므로, 스트리밍 방식을 깨지 않고 메뉴 일치가 먼저 노출됩니다.
+    items = list(extracted.places)
+    if menu_on:
+        items.sort(key=lambda it: not bool(getattr(it, "menu_match", False)))
+
     # 코드 레벨에서도 중복/기존 이름/반경 밖 후보를 한 번 더 걸러 냅니다(안전장치).
     seen_lower = {n.lower() for n in exclude_names}
     candidates: list[Place] = []
-    for item in extracted.places:
+    for item in items:
         name = (item.name or "").strip()
         if not name or name.lower() in seen_lower:
             continue
@@ -547,6 +590,8 @@ def search_candidates(
             category=item.category or place_type,
             address=item.address,
             reason=item.reason,
+            # (A) 뱃지용 신호: 메뉴가 지정됐을 때만 LLM 의 menu_match 를 반영(그 외엔 항상 False).
+            menu_match=bool(getattr(item, "menu_match", False)) if menu_on else False,
         )
 
         # ★ 반경 반영의 핵심: 카카오가 있으면 '중심 반경 이내'에서 실제로 찾은 곳만 후보로 채택.

@@ -34,6 +34,10 @@ class TripRequirements(BaseModel):
     companions: str = Field(default="", description="누구와 함께 가는지 (예: 3세대 가족, 아기·노부모 동반)")
     place_type: str = Field(default="", description="무엇을 찾는지 (예: 식당, 숙소, 식당+숙소)")
     region: str = Field(default="", description="어디로 가는지 = 검색 대상 지역 (예: 서울 송파구, 강남 일대)")
+    menu: str = Field(
+        default="",
+        description="원하는 음식/메뉴 (식당일 때만 의미 있는 '선택' 조건, 예: 삼겹살·파스타·국밥). 없으면 빈 문자열",
+    )
 
     # ↓ 심층 검증에서 실제로 확인할 '2가지 핵심 가변 메타데이터' 스위치
     need_no_stairs: bool = Field(
@@ -59,6 +63,12 @@ class Place(BaseModel):
     category: str = Field(default="", description="분류 (식당/숙소/카페 등)")
     address: str = Field(default="", description="주소 또는 위치 설명")
     reason: str = Field(default="", description="이 장소를 후보로 뽑은 간단한 이유")
+    # 발굴 단계에서 채워지는 '선택' 신호: 사용자가 원한 메뉴(예: 삼겹살)를 파는 근거가
+    #  검색 스니펫에 있으면 True. (계단/어린이메뉴 검증과 무관한, 단순 '메뉴 일치' 표시용)
+    menu_match: bool = Field(
+        default=False,
+        description="사용자가 원한 '메뉴'(예: 삼겹살)를 판다는 근거가 스니펫에 있으면 True. 메뉴 조건이 없거나 식당이 아니면 False",
+    )
 
     # --- 심층 검증 단계에서 채워지는 결과 ---
     # 'yes'(조건 충족) / 'no'(미충족) / 'unknown'(근거 부족) 3단계로 판정합니다.
