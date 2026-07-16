@@ -4,9 +4,9 @@ tools.py
 에이전트가 "바깥 세상"의 정보를 가져올 때 쓰는 도구(Tool) 모음입니다.
 
 여기 있는 도구는 아래와 같습니다.
-1) web_search_raw     : DuckDuckGo 로 일반 웹 검색 → 파이썬 리스트[dict] 반환 (후보군 탐색용)
+1) web_search_raw / web_search_many : DuckDuckGo 웹 검색 (단건 / 동시성 제한 병렬)
 2) targeted_review_search : "식당명 + 조건 + site:blog.naver.com" 형태의 타겟 검색 → 개별 리뷰 결과 리스트[{title,body,href}] 반환 (심층 검증용)
-3) geocode_place      : 장소명/주소 → 위경도 (실패 시 지역 중심으로 '폴백') — 지도 중심 잡기용
+3) geocode_place / geocode_region_center : 장소·지역 → 위경도 (지역 중심은 카카오 우선)
 4) locate_place(_info): 장소를 '지역 반경 안에서 확실히' 찾을 때만 좌표/상세 반환(아니면 None) — 정확한 핀용
                         (KAKAO_REST_API_KEY 가 있으면 카카오 로컬 검색으로 정확도↑ + place_url 확보, 없으면 Nominatim)
 5) fetch_place_hours_text : 카카오 장소 상세(place_url/id)에서 영업시간·휴무 텍스트를 긁어옴 — '오늘 영업 여부' 판정용
@@ -34,6 +34,7 @@ import math
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from langchain_core.tools import tool
@@ -102,6 +103,45 @@ def web_search_raw(query: str, max_results: int = 8, region: str = "kr-kr") -> l
             }
         )
     return normalized
+
+
+# DuckDuckGo 에 요청을 너무 몰아치면 차단·빈 결과가 늘 수 있어 동시성 상한을 둡니다.
+_SEARCH_MAX_WORKERS = 3
+
+
+def web_search_many(
+    queries: list[str],
+    max_results: int = 5,
+    region: str = "kr-kr",
+    max_workers: int = _SEARCH_MAX_WORKERS,
+) -> list[list[dict]]:
+    """여러 검색어를 동시에 조회하되, 동시 실행 수는 max_workers(기본 3)로 제한한다.
+
+    Returns:
+        입력 queries 와 같은 길이·순서의 결과 리스트.
+        개별 실패는 빈 리스트([])로 채워져, 호출측이 예외를 신경 쓰지 않아도 됩니다.
+    """
+    if not queries:
+        return []
+
+    workers = max(1, min(int(max_workers), len(queries), _SEARCH_MAX_WORKERS))
+    # 단건이면 스레드 풀 오버헤드 없이 바로 호출
+    if len(queries) == 1 or workers == 1:
+        return [web_search_raw(q, max_results=max_results, region=region) for q in queries]
+
+    results: list[list[dict]] = [[] for _ in queries]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        future_map = {
+            pool.submit(web_search_raw, q, max_results, region): i
+            for i, q in enumerate(queries)
+        }
+        for fut in as_completed(future_map):
+            i = future_map[fut]
+            try:
+                results[i] = fut.result() or []
+            except Exception:
+                results[i] = []
+    return results
 
 
 @tool
@@ -181,8 +221,11 @@ def targeted_review_search(
 
 # 무료 Nominatim(OpenStreetMap) 지오코딩 엔드포인트.
 # - API 키가 필요 없어 데모에 적합하지만, 국내 상호명은 못 찾는 경우가 많습니다.
+# - 동명 지역(예: '하남'→광주 하남동 vs 경기도 하남시)도 자주 틀리므로,
+#   '지역 중심'은 아래 geocode_region_center 가 카카오를 우선 사용합니다.
 # - 그래서 아래 SEOUL_AREA_COORDS 폴백 좌표를 함께 둡니다.
 _NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+_KAKAO_ADDRESS_URL = "https://dapi.kakao.com/v2/local/search/address.json"
 
 # 서울/수도권 주요 지역의 대략적인 중심 좌표 (지오코딩 실패 시 폴백용).
 # - 상호를 못 찾아도 "지역 중심 근처"에는 핀을 찍어 지도를 비우지 않기 위함입니다.
@@ -348,6 +391,112 @@ def _kakao_lookup(query: str, center: tuple[float, float] | None, radius_m: int)
     except Exception:
         pass
     return None
+
+
+def _kakao_address_coords(query: str) -> tuple[float, float] | None:
+    """카카오 주소 검색으로 지역/주소의 중심 좌표를 구한다. 실패 시 None."""
+    key = os.getenv("KAKAO_REST_API_KEY")
+    if not key or not (query or "").strip():
+        return None
+    try:
+        headers = {"Authorization": f"KakaoAK {key}"}
+        params = {"query": query.strip(), "size": 1}
+        resp = requests.get(_KAKAO_ADDRESS_URL, headers=headers, params=params, timeout=5)
+        if resp.status_code != 200:
+            return None
+        docs = resp.json().get("documents", [])
+        if not docs:
+            return None
+        d = docs[0]
+        # road_address 우선, 없으면 address
+        block = d.get("road_address") or d.get("address") or d
+        lat = block.get("y") or d.get("y")
+        lng = block.get("x") or d.get("x")
+        if lat is None or lng is None:
+            return None
+        return (float(lat), float(lng))
+    except Exception:
+        return None
+
+
+def _region_query_variants(region: str) -> list[str]:
+    """지역명 동명 오인(예: 하남→광주 하남동)을 줄이기 위한 검색어 후보 목록."""
+    key = (region or "").strip()
+    if not key:
+        return []
+    variants: list[str] = []
+    admin_suffix = ("시", "군", "구", "동", "읍", "면", "리", "특별시", "광역시", "특별자치시", "특별자치도")
+    has_admin = key.endswith(admin_suffix)
+
+    def _add(q: str) -> None:
+        q = q.strip()
+        if q and q not in variants:
+            variants.append(q)
+
+    if has_admin:
+        _add(key)
+        if key.endswith("시") and not key.endswith(("특별시", "광역시", "특별자치시")):
+            _add(f"{key}청")  # 하남시청
+        if key.endswith("구"):
+            _add(f"{key}청")  # 송파구청
+        _add(f"경기도 {key}")
+        _add(f"서울 {key}")
+    else:
+        # '하남'처럼 짧은 지명: 행정구역 형태를 먼저 시도
+        _add(f"{key}시")
+        _add(f"{key}시청")
+        _add(f"경기도 {key}시")
+        _add(f"{key}구")
+        _add(f"{key}구청")
+        _add(f"서울 {key}구")
+        _add(key)
+
+    return variants
+
+
+def geocode_region_center(region: str) -> tuple[float, float] | None:
+    """검색/지도의 '지역 중심' 좌표를 구한다. 카카오 우선, Nominatim은 폴백.
+
+    Nominatim 만 쓰면 '하남'이 광주 하남동 등으로 잡혀 반경 필터가 통째로 어긋날 수 있습니다.
+    카카오 키가 있으면 주소/키워드 검색으로 시·구 중심을 먼저 잡습니다.
+    """
+    key = (region or "").strip() or "서울"
+    variants = _region_query_variants(key)
+
+    # 1) 카카오: 주소 검색 → 키워드 검색 (시청/구청 등이 잘 잡힘)
+    if os.getenv("KAKAO_REST_API_KEY"):
+        for q in variants:
+            coords = _kakao_address_coords(q)
+            if coords:
+                return coords
+        for q in variants:
+            res = _kakao_lookup(q, center=None, radius_m=0)
+            if res:
+                return (res["lat"], res["lng"])
+
+    # 2) Nominatim: 경기도/서울을 붙여 동명 오인을 완화
+    nominatim_queries = []
+    for q in variants:
+        nominatim_queries.append(f"{q}, 대한민국")
+    nominatim_queries.extend(
+        [
+            f"{key}시, 경기도, 대한민국",
+            f"{key}, 경기도, 대한민국",
+            f"{key}, 서울, 대한민국",
+            f"{key}, 대한민국",
+        ]
+    )
+    seen: set[str] = set()
+    for q in nominatim_queries:
+        if q in seen:
+            continue
+        seen.add(q)
+        coords = geocode_exact(q, session_delay=0.5)
+        if coords:
+            return coords
+
+    # 3) 로컬 키워드 폴백 → 최후 서울시청
+    return _fallback_coords(key) or (37.5665, 126.9780)
 
 
 def locate_place_info(

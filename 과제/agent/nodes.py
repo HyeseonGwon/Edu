@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import contextvars
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Callable, Literal, Optional
 
@@ -51,10 +52,10 @@ from .config import make_llm
 from .state import FamilyTripState, Place, TripRequirements
 from .tools import (
     fetch_place_hours_text,
-    geocode_place,
+    geocode_region_center,
     locate_place_info,
     targeted_review_search,
-    web_search_raw,
+    web_search_many,
 )
 
 # LangGraph 커스텀 스트리밍용 writer (없는 버전이어도 앱이 죽지 않게 방어적 import)
@@ -662,9 +663,10 @@ def search_candidates(
     kakao_on = bool(os.getenv("KAKAO_REST_API_KEY"))
 
     # 리필 회차에 따라 검색어 풀에서 다른 구간을 골라 씁니다.
-    #  - 예: 0회차 → 0~3번, 1회차 → 2~5번 ... 겹치며 이동해 새 결과를 유도
+    #  - 예: 0회차 → 0~2번, 1회차 → 2~4번 ... 겹치며 이동해 새 결과를 유도
+    #  - 리필당 기본 쿼리는 3개(품질·속도 균형). 반경이 넓으면 nearby 를 추가로 덧붙임.
     start = (refill_index * 2) % len(QUERY_TEMPLATES)
-    picked = [QUERY_TEMPLATES[(start + k) % len(QUERY_TEMPLATES)] for k in range(4)]
+    picked = [QUERY_TEMPLATES[(start + k) % len(QUERY_TEMPLATES)] for k in range(3)]
     queries: list[str] = []
     for query_term in query_terms:
         queries.extend(t.format(region=region, pt=query_term) for t in picked)
@@ -676,9 +678,10 @@ def search_candidates(
             tmpl = NEARBY_QUERY_TEMPLATES[(refill_index + k) % len(NEARBY_QUERY_TEMPLATES)]
             queries.append(tmpl.format(region=region, pt=query_term))
 
+    # DuckDuckGo 호출은 동시 2~3개로 병렬화해 리필 대기 시간을 줄입니다.
     raw_snippets: list[str] = []
-    for q in queries:
-        for r in web_search_raw(q, max_results=5):
+    for batch in web_search_many(queries, max_results=5):
+        for r in batch:
             raw_snippets.append(f"- {r['title']} | {r['body']} | {r['href']}")
 
     if not raw_snippets:
@@ -1031,23 +1034,53 @@ def validate_place(place: Place, req: TripRequirements, label: str = "") -> bool
     # --- 1) 조건별 타겟 검색 (요구한 조건만 검색해 비용 절감) ---
     #  개별 리뷰 결과(리스트)를 받아 두었다가, LLM 이 지목한 '근거 리뷰 번호'의 URL 만
     #  '자세히 보기' 링크로 씁니다. (근거-링크 불일치/엉뚱한 가게 링크 방지)
+    #  대가족 시나리오에서는 계단·메뉴가 동시에 켜지는 경우가 많아, 둘 다 필요하면
+    #  DuckDuckGo 조회를 병렬로 돌려 검증 대기 시간을 줄입니다.
     stair_results: list[dict] = []
     menu_results: list[dict] = []
     check_kid_menu = _needs_kid_menu_for_place(place, req)
-    if req.need_no_stairs:
-        _emit(f"{label}'{place.name}'의 계단·접근성 정보를 조회 중...")
-        stair_results = targeted_review_search(
-            place.name, region, "계단 유아차 엘리베이터 입구 층"
-        )
-    if check_kid_menu:
-        _emit(f"{label}'{place.name}'의 안 매운·어린이 메뉴 정보를 조회 중...")
-        menu_results = targeted_review_search(
-            place.name, region, "어린이 메뉴 안매운 아이 유아"
-        )
-    elif req.need_kid_friendly:
-        # 숙소 등: 메뉴 조건은 요청됐으나 이 후보에는 적용하지 않음
-        _emit(f"{label}'{place.name}'은(는) 숙소라 메뉴 조건은 건너뜁니다.")
-        place.menu_note = "숙소라 안매운/어린이 메뉴 조건은 적용하지 않았어요."
+    need_stairs = bool(req.need_no_stairs)
+
+    if need_stairs and check_kid_menu:
+        _emit(f"{label}'{place.name}'의 계단·접근성 / 안 매운·어린이 메뉴를 동시에 조회 중...")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut_stair = pool.submit(
+                targeted_review_search,
+                place.name,
+                region,
+                "계단 유아차 엘리베이터 입구 층",
+            )
+            fut_menu = pool.submit(
+                targeted_review_search,
+                place.name,
+                region,
+                "어린이 메뉴 안매운 아이 유아",
+            )
+            try:
+                stair_results = fut_stair.result() or []
+            except Exception as e:
+                print(f"[validate_place] '{place.name}' 계단 검색 실패:", e)
+                stair_results = []
+            try:
+                menu_results = fut_menu.result() or []
+            except Exception as e:
+                print(f"[validate_place] '{place.name}' 메뉴 검색 실패:", e)
+                menu_results = []
+    else:
+        if need_stairs:
+            _emit(f"{label}'{place.name}'의 계단·접근성 정보를 조회 중...")
+            stair_results = targeted_review_search(
+                place.name, region, "계단 유아차 엘리베이터 입구 층"
+            )
+        if check_kid_menu:
+            _emit(f"{label}'{place.name}'의 안 매운·어린이 메뉴 정보를 조회 중...")
+            menu_results = targeted_review_search(
+                place.name, region, "어린이 메뉴 안매운 아이 유아"
+            )
+        elif req.need_kid_friendly:
+            # 숙소 등: 메뉴 조건은 요청됐으나 이 후보에는 적용하지 않음
+            _emit(f"{label}'{place.name}'은(는) 숙소라 메뉴 조건은 건너뜁니다.")
+            place.menu_note = "숙소라 안매운/어린이 메뉴 조건은 적용하지 않았어요."
 
     # --- 2) LLM 판독 (근거가 없으면 unknown) ---
     _emit(f"{label}'{place.name}' 리뷰를 읽고 조건을 판정 중...")
@@ -1171,11 +1204,15 @@ _center_cache: dict[str, tuple[float, float]] = {}
 
 
 def _region_center(region: str) -> tuple[float, float]:
-    """지역명을 지오코딩해 지도 '검색 중심' 좌표를 돌려준다(캐시 사용, 실패 시 서울시청)."""
+    """지역명을 지오코딩해 지도 '검색 중심' 좌표를 돌려준다(캐시 사용).
+
+    카카오 키가 있으면 카카오로 시·구 중심을 잡고, 없으면 Nominatim(동명 완화 쿼리)으로
+    폴백합니다. Nominatim 단독으로 '하남'→광주 하남동처럼 어긋나던 문제를 피합니다.
+    """
     key = region or "서울"
     if key in _center_cache:
         return _center_cache[key]
-    center = geocode_place(f"{key}, 대한민국") or (37.5665, 126.9780)
+    center = geocode_region_center(key) or (37.5665, 126.9780)
     _center_cache[key] = center
     return center
 
