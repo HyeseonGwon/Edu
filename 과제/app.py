@@ -547,7 +547,7 @@ def render_finalist_list():
                 )
                 show_menu = need_menu and not is_lodge
                 if need_stairs:
-                    st.write(f"**계단 접근성**: {status_map.get(p.get('stair_status'), '확인필요 ❓')}")
+                    st.write(f"**적은 계단**: {status_map.get(p.get('stair_status'), '확인필요 ❓')}")
                     if p.get("stair_note"):
                         st.caption(f"↳ {p['stair_note']}")
                     if p.get("stair_source"):
