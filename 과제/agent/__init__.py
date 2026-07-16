@@ -17,9 +17,11 @@ from .nodes import (
     TARGET_FINALISTS,
     build_map_html,
     build_search_summary,
+    check_open_today,
     reset_progress_sink,
     search_candidates,
     set_progress_sink,
+    sort_finalists,
     validate_place,
 )
 from .state import FamilyTripState, Place, TripRequirements
@@ -33,10 +35,12 @@ __all__ = [
     # 후보를 '한 개씩' 검증하는 검색 루프용 유틸 (main.py 의 /search/step 에서 사용)
     "search_candidates",
     "validate_place",
+    "check_open_today",
     "build_map_html",
     "build_search_summary",
     "set_progress_sink",
     "reset_progress_sink",
+    "sort_finalists",
     "TARGET_FINALISTS",
     "REFILL_SIZE",
     "MAX_CANDIDATES_TOTAL",

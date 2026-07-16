@@ -59,7 +59,7 @@ def _bg_data_uri(path: str) -> str | None:
 #    (그래서 아래 CSS 주입(st.markdown)은 이 호출 뒤에 둡니다.)
 # ──────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="대가족 여행 코디네이터",
+    page_title="대가족 나들이 코디네이터",
     page_icon="👪",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -170,6 +170,15 @@ if _bg_uri:
 
 DEFAULT_API = "http://127.0.0.1:8000"
 TARGET_FINALISTS = 5  # 목표 최종 후보 수(서버의 TARGET_FINALISTS 와 맞춤)
+# 지도·리스트 높이 정렬
+#  - MAP_HEIGHT: Folium 지도 iframe 높이
+#  - SLIDER_ROW_HEIGHT: 지도 위 '반경 슬라이더+다시찾기' 행의 대략 높이
+#  - LIST_TITLE_HEIGHT: 리스트 위 '최종 추천 N곳' 제목 대략 높이
+#  → 리스트 박스 = 지도 + 슬라이더행 − 제목  → 좌우 하단이 맞춰짐
+MAP_HEIGHT = 500
+SLIDER_ROW_HEIGHT = 88
+LIST_TITLE_HEIGHT = 28
+LIST_HEIGHT = MAP_HEIGHT + SLIDER_ROW_HEIGHT - LIST_TITLE_HEIGHT  # ≈ 560
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -199,6 +208,23 @@ _init_state()
 # ──────────────────────────────────────────────────────────────────────────
 # 서버 통신 헬퍼
 # ──────────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_health(api_base: str) -> dict | None:
+    """백엔드 /health 를 호출해 상태(dict)를 돌려준다. (연결 실패 시 None)
+
+    - Kakao Local API 연결 여부(kakao) 등을 사이드바 배너로 보여주는 데 씁니다.
+    - Streamlit 은 재실행이 잦아 매번 호출하면 낭비이므로 짧게 캐시(ttl=15s)합니다.
+      (api_base 가 바뀌면 캐시 키가 달라져 자동으로 다시 조회합니다.)
+    """
+    try:
+        r = requests.get(f"{api_base}/health", timeout=5)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        return None
+    return None
+
+
 def call_chat(message: str) -> dict | None:
     """(비스트리밍 대체용) FastAPI /chat 을 한 번에 호출해 응답(dict)을 돌려준다.
 
@@ -470,44 +496,71 @@ def render_finalist_list():
     need_stairs = bool(req.get("need_no_stairs"))
     need_menu = bool(req.get("need_kid_friendly"))
     if finalists:
-        st.markdown(f"**📍 최종 추천 {len(finalists)}곳**  ·  조건 모두 통과 🟢")
-    # 고정 높이 컨테이너 → 항목이 많아지면 이 영역 안에서만 스크롤됩니다.
-    list_box = st.container(height=460, border=True)
+        st.markdown(f"**📍 최종 추천 {len(finalists)}곳**")
+    else:
+        st.markdown("**📍 최종 추천**")
+    # 지도(MAP_HEIGHT) + 위쪽 슬라이더 행을 반영한 LIST_HEIGHT.
+    #  (제목은 이미 그렸으므로 LIST_HEIGHT 에 제목 분을 빼 두어 하단이 지도와 맞춤)
+    list_box = st.container(height=LIST_HEIGHT, border=True)
     with list_box:
         if not finalists:
             st.caption("조건을 모두 통과한 곳이 여기에 하나씩 추가됩니다. 아래 대화창에서 조건을 알려주세요.")
         status_map = {"yes": "충족 ✅", "no": "미충족 ❌", "unknown": "확인필요 ❓"}
         for i, p in enumerate(finalists, 1):
-            # 지도에 핀이 찍혔는지(정확한 위치 확인 여부)를 제목 배지로 함께 표시
-            pin_badge = "📍 지도 표시" if p.get("located") else "🗺️ 위치 미확인"
-            # 사용자가 원한 메뉴를 파는 근거가 있으면 '메뉴 일치' 뱃지를 덧붙임(선택 조건)
-            menu_badge = "  ·  🍽️ 메뉴 일치" if p.get("menu_match") else ""
+            # 제목엔 추가 정보 뱃지만: 메뉴 일치 · 오늘 영업중
+            #  (통과·지도표시는 리스트=통과 결과, 핀=위치 확실할 때만 찍히므로 생략)
+            badges: list[str] = []
+            if p.get("menu_match"):
+                badges.append("🍽️ 메뉴 일치")
+            if p.get("open_today") == "open":
+                badges.append("🟢 오늘 영업중!")
+            badge_txt = ("  ·  " + "  ·  ".join(badges)) if badges else ""
             with st.expander(
-                f"{i}. {p.get('name','(이름 미상)')}  ·  🟢 통과  ·  {pin_badge}{menu_badge}",
+                f"{i}. {p.get('name','(이름 미상)')}{badge_txt}",
                 expanded=(i == 1),
             ):
                 st.write(f"**분류**: {p.get('category') or '장소'}")
+                # 주소는 카카오 도로명 주소를 우선 채우므로, 있으면 항상 보여 줌
                 if p.get("address"):
-                    st.write(f"**위치**: {p['address']}")
+                    st.write(f"**주소**: {p['address']}")
+                else:
+                    st.caption("↳ 주소 정보를 확인하지 못했어요.")
+                # 카카오 장소 상세 링크 — 식당/숙소 공통 (검증 조건과 무관하게 항상 표시)
+                if p.get("place_url"):
+                    st.markdown(f"[🗺️ 카카오맵에서 보기]({p['place_url']})")
                 if p.get("menu_match") and req.get("menu"):
                     st.write(f"**메뉴**: '{req.get('menu')}' 취급 언급 있음 🍽️")
+                # 오늘 영업 여부(추가 정보): 영업중이면 시간까지, 미확인이면 안내만
+                if p.get("open_today") == "open":
+                    hours_txt = p.get("today_hours") or ""
+                    st.write("**오늘 영업**: 영업중 🟢" + (f"  ·  {hours_txt}" if hours_txt else ""))
+                elif p.get("open_today") == "unknown":
+                    st.caption("↳ 오늘 영업 여부는 확인하지 못했어요. 방문 전 확인을 권해요.")
                 if not p.get("located"):
-                    st.caption("↳ 정확한 좌표를 확인하지 못해 지도에는 핀을 표시하지 않았어요. (상호명으로 직접 검색해 확인해 주세요)")
+                    st.caption("↳ 정확한 좌표를 확인하지 못해 지도에는 핀을 표시하지 않았어요.")
 
-                # 요구한 조건만 노출 (요구하지 않은 항목은 표시하지 않음)
+                # 요구한 조건만 노출 (요구하지 않은 항목·숙소의 메뉴 조건은 표시하지 않음)
+                cat = p.get("category") or ""
+                is_lodge = any(
+                    k in cat
+                    for k in ("숙소", "호텔", "펜션", "모텔", "게스트하우스", "리조트", "민박")
+                )
+                show_menu = need_menu and not is_lodge
                 if need_stairs:
                     st.write(f"**계단 접근성**: {status_map.get(p.get('stair_status'), '확인필요 ❓')}")
                     if p.get("stair_note"):
                         st.caption(f"↳ {p['stair_note']}")
                     if p.get("stair_source"):
                         st.markdown(f"[🔗 자세히 보기]({p['stair_source']})")
-                if need_menu:
+                if show_menu:
                     st.write(f"**어린이/안매운 메뉴**: {status_map.get(p.get('menu_status'), '확인필요 ❓')}")
                     if p.get("menu_note"):
                         st.caption(f"↳ {p['menu_note']}")
                     if p.get("menu_source"):
                         st.markdown(f"[🔗 자세히 보기]({p['menu_source']})")
-                if not need_stairs and not need_menu:
+                elif need_menu and is_lodge and p.get("menu_note"):
+                    st.caption(f"↳ {p['menu_note']}")
+                if not need_stairs and not show_menu and not (need_menu and is_lodge):
                     st.caption("요청하신 별도 검증 조건이 없어요.")
 
 
@@ -517,6 +570,24 @@ def render_finalist_list():
 with st.sidebar:
     st.header("⚙️ 설정")
     st.session_state.api_base = st.text_input("백엔드 API 주소", value=st.session_state.api_base)
+
+    # ── Kakao Map API 연결 상태 배너 ──
+    #  백엔드 /health 가 알려 주는 kakao 값으로, 지도 정확도·폐업/휴무 필터 동작 여부를 안내.
+    _health = fetch_health(st.session_state.api_base)
+    if _health is None:
+        st.error("🔴 백엔드에 연결할 수 없어요. 위 주소를 확인하거나 서버를 실행해 주세요.")
+    elif _health.get("kakao"):
+        st.success(
+            "🟢 **Kakao Map API 연결됨**\n\n"
+            "정확한 위치에 핀을 찍고, **폐업·오늘 휴무 업체는 자동으로 제외**돼요."
+        )
+    else:
+        st.warning(
+            "🟡 **Kakao Map API 미연결**\n\n"
+            "정확한 위치에 핀이 표시되지 않을 수 있고, "
+            "**폐업했거나 오늘 휴무인 업체가 결과에 포함**될 수 있어요.\n\n"
+            "`실습/.env` 에 `KAKAO_REST_API_KEY` 를 넣고 서버를 재시작하면 정확도가 크게 올라갑니다."
+        )
 
     if st.button("🔄 새 여행 계획 시작", use_container_width=True):
         reset_session()
@@ -536,42 +607,16 @@ with st.sidebar:
 # ──────────────────────────────────────────────────────────────────────────
 # 상단 헤더: 타이틀 (사이드바는 좌측 상단의 기본 '<<' 컨트롤로 접을 수 있어요)
 # ──────────────────────────────────────────────────────────────────────────
-st.title("👪 대가족 여행 코디네이터")
+st.title("👪 대가족 나들이 코디네이터")
 st.caption("대화로 조건을 알려주시면, 계단 여부·아이 메뉴까지 검증해 조건을 모두 통과한 곳만 지도에 추천해요.")
 
 # 검색 진행 UI 를 그릴 자리(placeholder). 실제 실행은 화면 맨 아래에서 합니다.
 search_panel = st.empty()
 
 # ══════════════════════════════════════════════════════════════════════════
-# [상단] 추천 결과 — 왼쪽: 지도 / 오른쪽: 업체 리스트(스크롤)
-#  헤더 우측에 '검색 반경' 슬라이더 + '다시 찾아보기' 버튼을 둡니다.
-#   (지역에 결과가 드물 때 반경을 넓혀 즉시 재검색하는 흐름을 위해)
+# [상단] 추천 결과 — 왼쪽: 지도(+반경 컨트롤) / 오른쪽: 업체 리스트(스크롤)
 # ══════════════════════════════════════════════════════════════════════════
-head_title, head_radius, head_btn = st.columns([4, 3, 2], gap="small", vertical_alignment="bottom")
-with head_title:
-    st.subheader("🗺️ 추천 결과")
-with head_radius:
-    st.session_state.search_radius_km = st.slider(
-        "🔍 검색 반경 (km)",
-        min_value=1,
-        max_value=20,
-        value=int(st.session_state.search_radius_km),
-        step=1,
-        help="지역에 결과가 드물면 반경을 넓힌 뒤 오른쪽 '다시 찾아보기'를 눌러 주세요. (최대 20km)",
-        disabled=st.session_state.search_active,
-    )
-with head_btn:
-    st.button(
-        "🔎 다시 찾아보기",
-        on_click=_restart_search,
-        use_container_width=True,
-        disabled=(
-            st.session_state.search_active
-            or not st.session_state.session_id
-            or not st.session_state.requirements
-        ),
-        help="현재 반경으로 후보를 처음부터 다시 찾습니다.",
-    )
+st.subheader("🗺️ 추천 결과")
 
 # 조건 수집 현황을 한 줄로 요약 (공간 절약)
 req = st.session_state.requirements
@@ -596,16 +641,42 @@ if req:
 
 col_map, col_list = st.columns([3, 2], gap="large")
 
-# ── 왼쪽: Folium 지도 ──
+# ── 왼쪽: 검색 반경 컨트롤 + Folium 지도 ──
+#  슬라이더·다시찾기는 '지도의 검색 영역'을 조절하는 컨트롤이므로 지도 바로 위에 둡니다.
 with col_map:
+    radius_col, btn_col = st.columns([3, 2], gap="small", vertical_alignment="bottom")
+    with radius_col:
+        st.session_state.search_radius_km = st.slider(
+            "🔍 검색 반경 (km)",
+            min_value=1,
+            max_value=20,
+            value=int(st.session_state.search_radius_km),
+            step=1,
+            help="지역에 결과가 드물면 반경을 넓힌 뒤 '다시 찾아보기'를 눌러 주세요. (최대 20km)",
+            disabled=st.session_state.search_active,
+        )
+    with btn_col:
+        st.button(
+            "🔎 다시 찾아보기",
+            on_click=_restart_search,
+            use_container_width=True,
+            disabled=(
+                st.session_state.search_active
+                or not st.session_state.session_id
+                or not st.session_state.requirements
+            ),
+            help="현재 반경으로 후보를 처음부터 다시 찾습니다.",
+        )
+
     if st.session_state.map_html:
-        components.html(st.session_state.map_html, height=500, scrolling=False)
+        components.html(st.session_state.map_html, height=MAP_HEIGHT, scrolling=False)
         st.caption(
-            "🔵 파란 원 = 검색 영역 ·  📍 초록 핀 = 위치가 확인된 곳  "
-            "(정확한 좌표를 못 찾은 곳은 핀을 생략했어요)"
+            "🔵 파란 원 = 검색 영역 ·  📍 초록 핀 = 정확한 위치가 확인된 곳  "
         )
     else:
-        st.info("아직 지도가 없어요. 아래 대화창에서 조건을 알려주시면 지도가 나타납니다.")
+        # 지도 없을 때도 슬라이더 아래 영역을 지도와 같은 높이로 유지
+        with st.container(height=MAP_HEIGHT, border=True):
+            st.info("아직 지도가 없어요. 아래 대화창에서 조건을 알려주시면 지도가 나타납니다.")
 
 # ── 오른쪽: 업체 리스트(스크롤) ──
 with col_list:

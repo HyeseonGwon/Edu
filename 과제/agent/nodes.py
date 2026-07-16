@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import contextvars
 import os
+from datetime import datetime
 from typing import Callable, Literal, Optional
 
 import folium
@@ -48,7 +49,13 @@ from pydantic import BaseModel, Field
 
 from .config import make_llm
 from .state import FamilyTripState, Place, TripRequirements
-from .tools import geocode_place, locate_place, targeted_review_search, web_search_raw
+from .tools import (
+    fetch_place_hours_text,
+    geocode_place,
+    locate_place_info,
+    targeted_review_search,
+    web_search_raw,
+)
 
 # LangGraph 커스텀 스트리밍용 writer (없는 버전이어도 앱이 죽지 않게 방어적 import)
 try:
@@ -146,9 +153,10 @@ class CollectResult(BaseModel):
     place_type: str = Field(
         default="",
         description=(
-            "무엇을 찾는지 (식당/숙소/둘다). 사용자가 명시했거나 문맥상 분명히 추론되면 채웁니다. "
-            "예: '배고프다/밥/맛집/식사' → '식당', '떠나고싶다/쉬고싶다/자고싶다/1박' → '숙소'. "
-            "근거가 전혀 없으면 빈 문자열."
+            "무엇을 찾는지. 허용값: '식당' / '숙소' / '식당+숙소'. "
+            "사용자가 명시했거나 문맥상 분명히 추론되면 채웁니다. "
+            "예: '배고프다/밥/맛집/식사' → '식당', '떠나고싶다/쉬고싶다/자고싶다/1박' → '숙소', "
+            "'둘다/둘 다/식당과 숙소' → '식당+숙소'. 근거가 전혀 없으면 빈 문자열."
         ),
     )
     menu: str = Field(
@@ -180,7 +188,13 @@ class CollectResult(BaseModel):
         ),
     )
     need_no_stairs: bool = Field(default=False, description="계단이 적어야 하면 True")
-    need_kid_friendly: bool = Field(default=False, description="어린이/안매운 메뉴가 필요하면 True")
+    need_kid_friendly: bool = Field(
+        default=False,
+        description=(
+            "어린이/안매운 메뉴가 필요하면 True. "
+            "단, place_type 이 숙소(호텔·펜션 등)만이면 아이 동반이어도 반드시 False."
+        ),
+    )
     extra_notes: str = Field(default="", description="기타 요청")
     info_complete: bool = Field(
         description="누구와/무엇을/어디로 3가지가 모두 파악되었으면 True"
@@ -203,6 +217,9 @@ STATE_MANAGER_SYSTEM = (
     "- '무엇을(place_type)'은 사용자가 식당/밥/식사/맛집/카페 또는 숙소/호텔/펜션 등을 '명시'하면 채웁니다. "
     "명시하지 않았어도 문맥상 분명히 추론되면 채우세요 "
     "(예: '배고프다/밥/맛집' → '식당', '떠나고싶다/쉬고싶다/자고싶다/1박' → '숙소').\n"
+    "- ★ 사용자가 '둘다/둘 다/식당과 숙소/숙소랑 식당'이라고 답하면 place_type 은 반드시 '식당+숙소' 로 두세요. "
+    "'식당'이나 '숙소' 한쪽만으로 바꾸지 마세요. ('둘다'라는 문자열을 place_type 에 쓰지 마세요.)\n"
+    "- 어시스턴트가 '식당과 숙소 중 무엇을' 물었고 사용자가 '둘다'라고 답한 경우도 place_type='식당+숙소' 입니다.\n"
     "- 사용자가 먹고 싶은 '메뉴/음식'을 말하면 menu 에 적으세요(예: '삼겹살', '파스타', '국밥'). "
     "menu 는 '식당'일 때만 의미 있는 '선택' 조건이라, 말하지 않으면 빈 문자열로 두고 절대 되묻지 마세요.\n"
     "- '어디로(region)'는 더 엄밀합니다. 사용자가 '실제 지명'을 직접 말했을 때만 region 을 채우고, "
@@ -217,8 +234,11 @@ STATE_MANAGER_SYSTEM = (
     "- 지금까지의 대화 '전체'를 근거로 현재까지 파악된 값을 채우세요. 이미 '명시된' 정보는 유지하세요.\n"
     "- '할머니/할아버지/조부모/노부모/어르신/아기/유모차/휠체어/무릎/거동' 등 "
     "거동이 불편할 수 있는 동반자가 언급되면 need_no_stairs=True (계단이 적은 곳) 로 두세요.\n"
-    "- '아이/아들/딸/자녀/어린이/유아/안 매운' 등 아이 동반이 언급되면 "
+    "- '아이/아들/딸/자녀/어린이/유아/안 매운' 등 아이 동반이 언급되고 "
+    "무엇을(place_type)이 '식당'(또는 카페·맛집·식당+숙소)이면 "
     "need_kid_friendly=True (맵지 않은/어린이 메뉴) 로 두세요.\n"
+    "- ★ place_type 이 '숙소'(호텔·펜션 등)만이면 아이와 함께여도 "
+    "need_kid_friendly=False 로 두세요. 안 매운/어린이 메뉴는 식사 장소 전용 조건입니다.\n"
     "- 3가지가 모두 파악되면 info_complete=True, 아니면 False 로 두고,\n"
     "  부족한 항목 '하나만' 콕 집어 자연스럽게 되묻는 질문을 follow_up_question 에 쓰세요.\n"
     "- 되물을 때는 한 번에 하나씩만 물어 사용자가 부담을 느끼지 않게 하세요."
@@ -234,6 +254,138 @@ REGION_SUGGESTIONS = [
     "부산 해운대",
     "강원 강릉",
 ]
+
+
+# place_type 정규화 결과로 쓰는 표준 값
+PLACE_TYPE_BOTH = "식당+숙소"
+
+
+def _is_food_place_type(place_type: str) -> bool:
+    """place_type 이 '식사 장소'(식당·카페·맛집·식당+숙소)를 포함하는지 판정한다.
+
+    - 안 매운/어린이 메뉴·원하면 메뉴 검색은 식사 장소에서만 의미가 있습니다.
+    - '숙소'·'호텔'·'펜션'만이면 False → need_kid_friendly/menu 를 코드에서 끕니다.
+    """
+    pt = (place_type or "").strip()
+    if not pt:
+        return False
+    return any(k in pt for k in ("식당", "카페", "맛집", "둘다"))
+
+
+def _is_both_place_type(place_type: str) -> bool:
+    """식당과 숙소를 모두 찾는 요청인지."""
+    pt = (place_type or "").strip()
+    return pt == PLACE_TYPE_BOTH or "둘다" in pt or ("식당" in pt and "숙소" in pt)
+
+
+def _is_lodging_category(category: str) -> bool:
+    """분류가 숙소(호텔·펜션 등) 계열인지."""
+    c = category or ""
+    return any(
+        k in c
+        for k in ("숙소", "호텔", "펜션", "모텔", "게스트하우스", "리조트", "민박", "캠핑", "여관")
+    )
+
+
+def _is_food_category(category: str) -> bool:
+    """분류가 식당·카페 등 식사 장소 계열인지."""
+    c = category or ""
+    return any(k in c for k in ("식당", "카페", "맛집", "음식", "레스토랑", "밥집", "술집", "베이커리"))
+
+
+def _normalize_place_category(raw: str, place_type: str) -> str:
+    """후보 category 를 '식당'/'숙소'/'카페' 등으로 정규화한다.
+
+    식당+숙소 검색에서 안매운 메뉴 검증을 식당에만 걸려면 분류가 분명해야 합니다.
+    """
+    raw = (raw or "").strip()
+    if _is_lodging_category(raw) and not _is_food_category(raw):
+        return "숙소"
+    if "카페" in raw:
+        return "카페"
+    if _is_food_category(raw):
+        return "식당"
+    pt = (place_type or "").strip()
+    if pt == "숙소" or (pt and _is_lodging_category(pt) and not _is_food_place_type(pt)):
+        return "숙소"
+    if pt == "식당":
+        return "식당"
+    # 식당+숙소인데 분류가 애매하면 빈 값 유지 → 검증 시 식당으로 간주하지 않고
+    #  숙소 키워드도 없으면 '식사 장소'로 보고 메뉴 검증(보수적)
+    return raw or "식당"
+
+
+def _needs_kid_menu_for_place(place: Place, req: TripRequirements) -> bool:
+    """이 후보에 안매운/어린이 메뉴 검증을 적용할지.
+
+    - 요청에 need_kid_friendly 가 없으면 False
+    - 숙소 계열이면 False (식당+숙소 검색이어도 숙소에는 메뉴 조건 미적용)
+    - 식당·카페 등 식사 장소면 True
+    """
+    if not req.need_kid_friendly:
+        return False
+    if _is_lodging_category(place.category) and not _is_food_category(place.category):
+        return False
+    return True
+
+
+def _finalist_sort_key(place: Place) -> tuple:
+    """최종 추천 정렬 키. 오늘 영업중(0) > 그 외(1), 그다음 메뉴 일치(0) > 그 외(1)."""
+    open_rank = 0 if place.open_today == "open" else 1
+    menu_rank = 0 if place.menu_match else 1
+    return (open_rank, menu_rank)
+
+
+def sort_finalists(places: list[Place]) -> list[Place]:
+    """최종 후보를 '오늘 영업중' 우선, '메뉴 일치' 차선으로 안정 정렬한다.
+
+    나중에 찾은 영업중 가게가 목록 위로 오도록, 추가할 때마다 다시 호출합니다.
+    """
+    return sorted(places, key=_finalist_sort_key)
+
+
+def _has_kid_companion(companions: str) -> bool:
+    """동반자 설명에 아이/자녀 계열 키워드가 있는지."""
+    text = companions or ""
+    return any(k in text for k in ("아이", "아들", "딸", "자녀", "어린이", "유아", "아기"))
+
+
+def _normalize_place_type(raw: str, user_text: str = "") -> str:
+    """place_type 을 '식당'/'숙소'/'식당+숙소' 중 하나로 정규화한다.
+
+    LLM 이 '둘다'를 '식당'으로 바꿔 버리거나, '둘다'라는 모호한 라벨을 쓰는 것을 막고
+    UI·검색에서 쓰기 쉬운 '식당+숙소'로 통일합니다.
+    """
+    blob = f"{user_text} {raw}".strip()
+    both_keys = (
+        "둘다",
+        "둘 다",
+        "식당+숙소",
+        "식당과 숙소",
+        "숙소와 식당",
+        "식당이랑 숙소",
+        "숙소랑 식당",
+        "식당하고 숙소",
+        "숙소하고 식당",
+    )
+    if any(k in blob for k in both_keys):
+        return PLACE_TYPE_BOTH
+    pt = (raw or "").strip()
+    if not pt:
+        if any(k in user_text for k in ("숙소", "호텔", "펜션", "게스트하우스")):
+            return "숙소"
+        if any(k in user_text for k in ("식당", "밥", "맛집", "카페", "식사")):
+            return "식당"
+        return ""
+    if "둘다" in pt or ("식당" in pt and "숙소" in pt):
+        return PLACE_TYPE_BOTH
+    if any(k in pt for k in ("숙소", "호텔", "펜션")) and not any(
+        k in pt for k in ("식당", "카페", "맛집")
+    ):
+        return "숙소"
+    if any(k in pt for k in ("식당", "카페", "맛집")):
+        return "식당"
+    return pt
 
 
 def _ask_region(region_guess: str, region_undecided: bool) -> str:
@@ -303,25 +455,48 @@ def state_manager_node(state: FamilyTripState) -> dict:
         }
 
     # 추출 결과를 우리 도메인 모델(TripRequirements)로 변환
+    #  - 짧은 답변 턴(예: '둘다' → '식당+숙소')에서 LLM 이 이전 정보를 빠뜨리거나 place_type 을
+    #    잘못 바꾸는 경우가 있어, 이전 값 병합 + 키워드 정규화로 보정합니다.
     companions = (result.companions or "").strip()
-    place_type = (result.place_type or "").strip()
+    place_type = _normalize_place_type(result.place_type or "", user_text)
     region = (result.region or "").strip()
+    if prev is not None:
+        if not companions:
+            companions = (prev.companions or "").strip()
+        if not place_type:
+            place_type = _normalize_place_type(prev.place_type or "", "")
+        if not region:
+            region = (prev.region or "").strip()
     # 지역은 엄밀히 다룬다: 명시된 지명만 region 에 채우고,
     #  랜드마크로 추론된 지역은 region_guess(제안·확인용), 미정 의사는 region_undecided(추천용) 로 받는다.
     region_guess = (result.region_guess or "").strip()
     region_undecided = bool(result.region_undecided)
-    # 메뉴는 '식당'일 때만 의미 있는 선택 조건. 숙소 등에는 담지 않는다.
+    # 메뉴·안매운/어린이메뉴는 '식사 장소'(식당·식당+숙소) 전용.
+    #  - 숙소만이면 끔.
+    #  - 아들/아이 동반이면 LLM 이 False 로 내도 True 로 강제(대화 이력 누락 방지).
     menu = (result.menu or "").strip()
-    if place_type != "식당":
+    if prev is not None and not menu:
+        menu = (prev.menu or "").strip()
+    need_no_stairs = bool(result.need_no_stairs) or (
+        bool(prev.need_no_stairs) if prev is not None else False
+    )
+    need_kid_friendly = bool(result.need_kid_friendly)
+    if _is_food_place_type(place_type):
+        if _has_kid_companion(companions) or (
+            prev is not None and prev.need_kid_friendly and _is_food_place_type(place_type)
+        ):
+            need_kid_friendly = True
+    else:
         menu = ""
+        need_kid_friendly = False
     requirements = TripRequirements(
         companions=companions,
         place_type=place_type,
         region=region,
         menu=menu,
-        need_no_stairs=result.need_no_stairs,
-        need_kid_friendly=result.need_kid_friendly,
-        extra_notes=result.extra_notes,
+        need_no_stairs=need_no_stairs,
+        need_kid_friendly=need_kid_friendly,
+        extra_notes=result.extra_notes or ((prev.extra_notes if prev else "") or ""),
     )
 
     # ★ 완료 판정은 LLM 판단(result.info_complete)에 맡기지 않고,
@@ -338,7 +513,7 @@ def state_manager_node(state: FamilyTripState) -> dict:
         if not companions:
             question = "누구와 함께 가시나요? (예: 부모님·아기와 함께 3세대)"
         elif not place_type:
-            question = "식당과 숙소 중 무엇을 찾으시나요?"
+            question = "식당과 숙소 중 무엇을 찾으시나요? (식당+숙소 모두 가능)"
         elif not region:
             # 지역은 엄밀히: 랜드마크 추론은 '제안·확인', 미정이면 '추천'으로 명시적 선택을 유도.
             question = _ask_region(region_guess, region_undecided)
@@ -381,7 +556,10 @@ class _CandidateItem(BaseModel):
     """LLM이 검색 스니펫에서 추출할 후보 1건."""
 
     name: str = Field(description="가게의 '상호명'(간판 이름). 메뉴·음식 이름이 아님")
-    category: str = Field(default="", description="분류 (식당/숙소/카페 등)")
+    category: str = Field(
+        default="",
+        description="분류. 반드시 '식당'·'숙소'·'카페' 중 하나로. 호텔·펜션·민박은 '숙소', 음식점은 '식당'",
+    )
     address: str = Field(default="", description="스니펫에서 확인되는 '해당 지역' 포함 주소/위치. 없으면 빈 값")
     reason: str = Field(default="", description="후보로 뽑은 한 줄 이유")
     in_region: bool = Field(
@@ -471,11 +649,14 @@ def search_candidates(
     exclude_names = exclude_names or set()
     place_type = req.place_type or "식당"
     region = req.region or "서울"
-    # 메뉴는 '식당'을 검색할 때 쓰는 '선택' 조건. 있으면 검색어를 그 메뉴로 좁히고, 없으면 무시.
+    # 메뉴는 식사 장소(식당·식당+숙소)를 검색할 때 쓰는 '선택' 조건.
     menu = (getattr(req, "menu", "") or "").strip()
-    menu_on = bool(menu) and "식당" in place_type
-    #  검색어에 넣을 음식 표현: 메뉴가 있으면 메뉴로(예: '삼겹살 맛집'), 없으면 일반 유형으로('식당 맛집').
-    query_term = menu if menu_on else place_type
+    menu_on = bool(menu) and _is_food_place_type(place_type)
+    # '식당+숙소'면 식당·숙소 검색어를 함께 돌림. (라벨을 검색어에 그대로 넣지 않음)
+    if _is_both_place_type(place_type):
+        query_terms = ([menu] if menu_on else ["식당"]) + ["숙소"]
+    else:
+        query_terms = [menu if menu_on else place_type]
     radius_km = max(1.0, min(float(radius_km), 20.0))
     center = _region_center(region)
     kakao_on = bool(os.getenv("KAKAO_REST_API_KEY"))
@@ -484,13 +665,16 @@ def search_candidates(
     #  - 예: 0회차 → 0~3번, 1회차 → 2~5번 ... 겹치며 이동해 새 결과를 유도
     start = (refill_index * 2) % len(QUERY_TEMPLATES)
     picked = [QUERY_TEMPLATES[(start + k) % len(QUERY_TEMPLATES)] for k in range(4)]
-    queries = [t.format(region=region, pt=query_term) for t in picked]
+    queries: list[str] = []
+    for query_term in query_terms:
+        queries.extend(t.format(region=region, pt=query_term) for t in picked)
 
     # 반경이 넓으면 '인접 지역' 검색어를 덧붙여 후보 발굴 범위를 넓힙니다.
     n_nearby = _nearby_query_count(radius_km)
-    for k in range(n_nearby):
-        tmpl = NEARBY_QUERY_TEMPLATES[(refill_index + k) % len(NEARBY_QUERY_TEMPLATES)]
-        queries.append(tmpl.format(region=region, pt=query_term))
+    for query_term in query_terms:
+        for k in range(n_nearby):
+            tmpl = NEARBY_QUERY_TEMPLATES[(refill_index + k) % len(NEARBY_QUERY_TEMPLATES)]
+            queries.append(tmpl.format(region=region, pt=query_term))
 
     raw_snippets: list[str] = []
     for q in queries:
@@ -524,9 +708,9 @@ def search_candidates(
 
     menu_line = f" 특히 '{menu}' 메뉴를 원합니다." if menu_on else ""
     menu_rule = (
-        f"\n6. 가능하면 '{menu}'를 파는 곳 위주로 고르세요(선택 조건). "
+        f"\n7. 가능하면 '{menu}'를 파는 곳 위주로 고르세요(선택 조건). "
         "단, 위 1번대로 '상호명'만 추출하는 규칙은 그대로 지키세요.\n"
-        f"7. 스니펫에 그 가게가 '{menu}'를 판다는(또는 대표/전문으로 다룬다는) 근거가 보이면 "
+        f"8. 스니펫에 그 가게가 '{menu}'를 판다는(또는 대표/전문으로 다룬다는) 근거가 보이면 "
         "menu_match=true, 근거가 없으면 menu_match=false 로 표시하세요."
         if menu_on else ""
     )
@@ -541,7 +725,9 @@ def search_candidates(
         + region_rule
         + "3. 블로그/뉴스 '제목'이나 홍보 문구, 리스트 글 제목을 상호명으로 착각하지 마세요.\n"
         f"4. 같은 곳은 한 번만. 이름이 불분명하면 제외. 최대 {target_count}곳.\n"
-        "5. address 에는 스니펫에서 확인되는 주소/위치를 적으세요. 없으면 빈 값."
+        "5. address 에는 스니펫에서 확인되는 주소/위치를 적으세요. 없으면 빈 값.\n"
+        "6. category 는 반드시 '식당' / '숙소' / '카페' 중 하나로만 적으세요. "
+        "(호텔·펜션·게스트하우스·민박 → '숙소', 음식점·맛집 → '식당')."
         + menu_rule
         + exclude_hint
     )
@@ -585,25 +771,37 @@ def search_candidates(
             continue
 
         seen_lower.add(name.lower())  # 이번 리필 내 중복도 방지
+        category = _normalize_place_category(item.category, place_type)
         place = Place(
             name=name,
-            category=item.category or place_type,
+            category=category,
             address=item.address,
             reason=item.reason,
             # (A) 뱃지용 신호: 메뉴가 지정됐을 때만 LLM 의 menu_match 를 반영(그 외엔 항상 False).
-            menu_match=bool(getattr(item, "menu_match", False)) if menu_on else False,
+            #     숙소에는 메뉴 일치 뱃지를 붙이지 않음.
+            menu_match=(
+                bool(getattr(item, "menu_match", False))
+                if menu_on and not _is_lodging_category(category)
+                else False
+            ),
         )
 
         # ★ 반경 반영의 핵심: 카카오가 있으면 '중심 반경 이내'에서 실제로 찾은 곳만 후보로 채택.
         #    좌표를 여기서 확보해 두면 지도(build_map_html)가 재지오코딩 없이 그대로 핀을 찍습니다.
         if kakao_on:
-            coords = locate_place(place.name, place.address, region, center, radius_km)
-            if coords is None:
+            info = locate_place_info(place.name, place.address, region, center, radius_km)
+            if info is None:
                 print(f"[search_candidates] 반경 {radius_km:.0f}km 밖/미확인으로 제외: {name}")
                 continue
-            place.lat, place.lng = coords
+            place.lat, place.lng = info["lat"], info["lng"]
             place.located = True
             place.geo_checked = True
+            # 카카오가 준 도로명 주소를 우선 채움 → 결과 리스트에 정확한 주소가 보이게
+            if info.get("address"):
+                place.address = info["address"]
+            # 카카오 '장소 상세' 링크(place_url)를 확보해 두면, 검증 단계에서
+            #  이 페이지의 영업시간/휴무 텍스트로 '오늘 영업 여부'를 판정할 수 있습니다.
+            place.place_url = info.get("place_url", "")
 
         candidates.append(place)
         if len(candidates) >= target_count:
@@ -660,21 +858,129 @@ VALIDATOR_SYSTEM = (
     "- 반드시 '[가게명]에 적힌 바로 그 가게'를 다룬 리뷰만 근거로 삼으세요.\n"
     "  (다른 가게 후기나 '지역 맛집 리스트' 같은 일반 글은 근거로 쓰지 마세요.)\n"
     "- 판정의 '결정적 근거'가 된 리뷰 하나의 번호를 stair_source_index / menu_source_index 에 적으세요.\n"
-    "- 근거가 없어 unknown 으로 판정했거나, 그 가게를 다룬 리뷰가 하나도 없으면 index 를 0 으로 두세요."
+    "- 근거가 없어 unknown 으로 판정했거나, 그 가게를 다룬 리뷰가 하나도 없으면 index 를 0 으로 두세요.\n"
+    "\n"
+    "[무관 히트 — 절대 근거로 쓰지 마세요]\n"
+    "다음은 '무관'입니다. yes/no 근거나 *_source_index 로 쓰지 마세요.\n"
+    "  · 집밥/유아반찬/이유식/레시피·요리법 글\n"
+    "  · 육아·건강 일반 정보 (특정 식당 방문과 무관)\n"
+    "  · 다른 가게·다른 지역 후기\n"
+    "  · 맛집 리스트·랭킹·광고성 모음글 (이 가게를 구체적으로 서술하지 않음)\n"
+    "  · 가게명만 검색어에 걸려 스니펫에 키워드('어린이','메뉴')만 비슷한 글\n"
+    "무관 글만 있으면 status=unknown, *_source_index=0 으로 두세요."
 )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 오늘 영업/휴무 판정 (Kakao 장소 상세 → LLM)
+#  - 카카오 place_url 페이지의 영업시간/휴무 텍스트에서 '오늘' 상태만 뽑습니다.
+#  - '오늘 휴무'는 하드 컷(최종 결과 제외), '영업중'은 배지, '알 수 없음'은 그대로 둡니다.
+# ──────────────────────────────────────────────────────────────────────────
+class HoursCheck(BaseModel):
+    """LLM이 장소 상세 텍스트에서 뽑아낼 '오늘' 영업 상태."""
+
+    open_today: Literal["open", "closed", "unknown"] = Field(
+        description="오늘 영업 여부. open=오늘 영업, closed=오늘 정기휴무/휴무, unknown=근거 없음"
+    )
+    today_hours: str = Field(
+        default="",
+        description="오늘의 영업시간(예: '11:00~21:00'). 여러 구간이면 함께. 모르면 빈 문자열",
+    )
+    note: str = Field(default="", description="판정의 짧은 근거(예: '월요일 정기휴무 표기')")
+
+
+hours_checker = validator_llm.with_structured_output(HoursCheck)
+
+_WEEKDAYS_KR = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"]
+
+
+def _today_weekday_kr() -> str:
+    """오늘의 한국어 요일(예: '목요일')을 돌려준다. (실행 시점 기준)"""
+    return _WEEKDAYS_KR[datetime.now().weekday()]
+
+
+HOURS_SYSTEM = (
+    "당신은 가게의 '영업시간/휴무' 정보(카카오맵 장소 상세의 open_hours JSON)에서 "
+    "'오늘' 하루의 영업 여부와 영업시간만 정확히 뽑아내는 도우미입니다.\n"
+    "오늘이 무슨 요일인지 알려줄 테니, 반드시 '오늘 요일'에 해당하는 항목만 보고 판단하세요.\n"
+    "\n"
+    "[JSON 읽는 법]\n"
+    "- week_from_today.week_periods[].days[] 에 요일별 정보가 있습니다.\n"
+    "  · day_of_the_week_desc: 요일 표기(예: '목(7/16)')\n"
+    "  · is_highlight=true 인 항목이 '오늘'입니다. (요일 표기가 오늘과 같은 것을 골라도 됩니다)\n"
+    "  · on_days.start_end_time_desc: 그 날 영업시간(예: '07:00 ~ 20:00')\n"
+    "  · off_days_desc: '휴무일' 등 그 날 쉰다는 표기\n"
+    "- headline.display_text('영업 중'/'영업 종료' 등)는 현재 시각 기준 참고용일 뿐입니다.\n"
+    "\n"
+    "[판정 규칙]\n"
+    "- 오늘 항목에 off_days_desc(휴무일 등)가 있으면 open_today='closed'.\n"
+    "- 오늘 항목에 영업시간(on_days.start_end_time_desc)이 있으면 open_today='open' 이고 "
+    "today_hours 에 그 시간을 그대로 적으세요.\n"
+    "- 오늘 항목을 특정할 수 없거나 영업시간/휴무 정보가 전혀 없으면 반드시 open_today='unknown' (추측 금지)."
+)
+
+
+def check_open_today(place: Place, label: str = "") -> None:
+    """카카오 장소 상세(place_url)를 읽어 '오늘' 영업/휴무를 판정해 place 에 채운다.
+
+    - place.place_url 이 없으면(카카오 미사용/미확보) 아무것도 하지 않고 'unknown' 유지.
+    - 텍스트를 못 가져오거나 판정 실패 시에도 'unknown' 으로 두어 결과에서 빼지 않습니다.
+      (요구사항: 휴무 여부를 알 수 없어도 최종 결과에는 올리되 배지는 없음)
+    ※ 어떤 경우에도 예외를 던지지 않습니다.
+    """
+    if not place.place_url:
+        return  # 조회 근거(상세 링크) 자체가 없음 → unknown 유지
+
+    weekday = _today_weekday_kr()
+    _emit(f"{label}'{place.name}'의 오늘({weekday}) 영업 여부를 확인 중...")
+
+    # 1) 상세 페이지에서 영업시간/휴무 텍스트 수집 (실패 시 빈 문자열)
+    text = fetch_place_hours_text(place.place_url)
+    if not text.strip():
+        print(f"[check_open_today] '{place.name}' 영업정보 텍스트 없음 → unknown")
+        return
+
+    # 2) LLM 이 '오늘' 상태만 판정
+    try:
+        verdict: HoursCheck = hours_checker.invoke(
+            [
+                SystemMessage(content=HOURS_SYSTEM),
+                HumanMessage(
+                    content=(
+                        f"[오늘 요일] {weekday}\n"
+                        f"[가게명] {place.name}\n"
+                        f"[영업시간/휴무 정보]\n{text}"
+                    )
+                ),
+            ]
+        )
+        place.open_today = verdict.open_today
+        place.today_hours = (verdict.today_hours or "").strip()
+        if verdict.open_today == "closed":
+            print(f"[check_open_today] 오늘 휴무 🚫 {place.name} ({verdict.note})")
+        elif verdict.open_today == "open":
+            print(f"[check_open_today] 오늘 영업중 🟢 {place.name} {place.today_hours}")
+    except Exception as e:
+        # 판정 실패 → unknown 유지(결과에서 빼지 않음)
+        print(f"[check_open_today] '{place.name}' 판정 실패:", e)
 
 
 def _decide_pass(place: Place, req: TripRequirements) -> bool:
     """요구조건에 비추어 이 후보가 '모든 조건 통과'인지 결정하는 순수 함수.
 
     핵심 정책(요구사항 반영):
+        - '오늘 휴무(open_today=='closed')'는 하드 컷: 무조건 Drop.
+          (영업/알수없음은 이 조건으로 떨어뜨리지 않음)
         - 사용자가 요구한 조건은 반드시 'yes' 여야 통과.
         - 요구한 조건이 'no'(미달)이거나 'unknown'(불확실)이면 Drop.
+        - 안매운/어린이 메뉴는 '식사 장소'에만 적용. 숙소 후보는 메뉴 조건으로 탈락시키지 않음.
         - 사용자가 요구하지 않은 조건은 판정과 무관하게 통과에 영향 없음.
     """
+    if place.open_today == "closed":
+        return False
     if req.need_no_stairs and place.stair_status != "yes":
         return False
-    if req.need_kid_friendly and place.menu_status != "yes":
+    if _needs_kid_menu_for_place(place, req) and place.menu_status != "yes":
         return False
     return True
 
@@ -727,22 +1033,27 @@ def validate_place(place: Place, req: TripRequirements, label: str = "") -> bool
     #  '자세히 보기' 링크로 씁니다. (근거-링크 불일치/엉뚱한 가게 링크 방지)
     stair_results: list[dict] = []
     menu_results: list[dict] = []
+    check_kid_menu = _needs_kid_menu_for_place(place, req)
     if req.need_no_stairs:
         _emit(f"{label}'{place.name}'의 계단·접근성 정보를 조회 중...")
         stair_results = targeted_review_search(
             place.name, region, "계단 유아차 엘리베이터 입구 층"
         )
-    if req.need_kid_friendly:
+    if check_kid_menu:
         _emit(f"{label}'{place.name}'의 안 매운·어린이 메뉴 정보를 조회 중...")
         menu_results = targeted_review_search(
             place.name, region, "어린이 메뉴 안매운 아이 유아"
         )
+    elif req.need_kid_friendly:
+        # 숙소 등: 메뉴 조건은 요청됐으나 이 후보에는 적용하지 않음
+        _emit(f"{label}'{place.name}'은(는) 숙소라 메뉴 조건은 건너뜁니다.")
+        place.menu_note = "숙소라 안매운/어린이 메뉴 조건은 적용하지 않았어요."
 
     # --- 2) LLM 판독 (근거가 없으면 unknown) ---
     _emit(f"{label}'{place.name}' 리뷰를 읽고 조건을 판정 중...")
     try:
         evidence_text = (
-            f"[가게명] {place.name} ({region})\n"
+            f"[가게명] {place.name} ({region}) [분류] {place.category or ''}\n"
             f"[계단 관련 리뷰]\n{_format_reviews(stair_results)}\n\n"
             f"[메뉴 관련 리뷰]\n{_format_reviews(menu_results)}"
         )
@@ -754,26 +1065,41 @@ def validate_place(place: Place, req: TripRequirements, label: str = "") -> bool
         )
         place.stair_status = verdict.stair_status
         place.stair_note = verdict.stair_note
-        place.menu_status = verdict.menu_status
-        place.menu_note = verdict.menu_note
-        # ★ 근거 번호 → 그 리뷰의 URL 로 되돌려 출처를 연결 (판정에 실제 쓰인 글만)
+        if check_kid_menu:
+            place.menu_status = verdict.menu_status
+            place.menu_note = verdict.menu_note
+            place.menu_source = _pick_source(
+                menu_results, verdict.menu_source_index, verdict.menu_status
+            )
         place.stair_source = _pick_source(
             stair_results, verdict.stair_source_index, verdict.stair_status
-        )
-        place.menu_source = _pick_source(
-            menu_results, verdict.menu_source_index, verdict.menu_status
         )
     except Exception as e:
         # 판정 실패 시: 안전하게 unknown 유지 (Drop 대상)
         print(f"[validate_place] '{place.name}' 판정 실패:", e)
         place.stair_note = place.stair_note or "정보 확인이 어려웠습니다."
-        place.menu_note = place.menu_note or "정보 확인이 어려웠습니다."
+        if check_kid_menu:
+            place.menu_note = place.menu_note or "정보 확인이 어려웠습니다."
 
-    # --- 3) 통과 판정 ---
+    # --- 3) 오늘 영업/휴무 확인 (하드 컷) ---
+    #  요구한 계단/메뉴 조건을 이미 만족한 후보만 조회해 비용을 아낍니다.
+    #  카카오 place_url 이 없으면 조회를 건너뛰어 open_today='unknown' 으로 남습니다.
+    prelim_ok = (not req.need_no_stairs or place.stair_status == "yes") and (
+        not check_kid_menu or place.menu_status == "yes"
+    )
+    if prelim_ok:
+        check_open_today(place, label=label)
+
+    # --- 4) 통과 판정 ---
     place.passed = _decide_pass(place, req)
     if place.passed:
         print(f"[validate_place] 통과 ✅ {place.name}")
-        _emit(f"{label}'{place.name}' → 조건 충족, 목록에 추가합니다! ✅")
+        badge = " (오늘 영업중!)" if place.open_today == "open" else ""
+        _emit(f"{label}'{place.name}' → 조건 충족, 목록에 추가합니다!{badge} ✅")
+    elif place.open_today == "closed":
+        # 조건은 맞아도 '오늘 휴무'라 제외된 경우: 이유를 분명히 안내
+        print(f"[validate_place] 오늘 휴무로 제외 🚫 {place.name}")
+        _emit(f"{label}'{place.name}' → 오늘은 휴무라 제외합니다. 🚫")
     else:
         print(f"[validate_place] 탈락 ❌ {place.name} "
               f"(계단={place.stair_status}, 메뉴={place.menu_status})")
@@ -906,10 +1232,15 @@ def build_map_html(
             # 후보당 한 번만 위치 확인 (재호출 시에는 캐시된 결과 사용)
             if not p.geo_checked:
                 p.geo_checked = True
-                coords = locate_place(p.name, p.address, region, center, radius_km)
-                if coords is not None:
-                    p.lat, p.lng = coords
+                info = locate_place_info(p.name, p.address, region, center, radius_km)
+                if info is not None:
+                    p.lat, p.lng = info["lat"], info["lng"]
                     p.located = True
+                    # 지도 생성 시점에 주소를 새로 확보한 경우에도 리스트용 address 를 채움
+                    if info.get("address"):
+                        p.address = info["address"]
+                    if info.get("place_url") and not p.place_url:
+                        p.place_url = info["place_url"]
                 else:
                     p.located = False  # 정확한 위치 미확인 → 핀 생략
 
@@ -924,9 +1255,21 @@ def build_map_html(
                 lng += 0.0004
             used_coords.add((round(lat, 5), round(lng, 5)))
 
-            # 팝업 HTML: 이름 + '요구한 조건만' 배지·근거·자세히 보기 링크
+            # 팝업 HTML: 이름 + '오늘 영업' 배지 + '요구한 조건만' 배지·근거·자세히 보기 링크
             #  (요구하지 않은 조건은 표시하지 않습니다 — 결과를 요청 조건에 집중)
             popup_rows = [f"<b>{p.name}</b>", f"<span style='color:gray'>{p.category or ''}</span>"]
+            if p.address:
+                popup_rows.append(f"<small>{p.address}</small>")
+            if p.place_url:
+                popup_rows.append(
+                    f"<small><a href='{p.place_url}' target='_blank'>카카오맵에서 보기</a></small>"
+                )
+            # 오늘 영업중이면 초록 배지 + 오늘 영업시간(있으면)을 함께 표시
+            if p.open_today == "open":
+                hours_txt = f" {p.today_hours}" if p.today_hours else ""
+                popup_rows.append(
+                    f"<span style='color:green;font-weight:bold'>🟢 오늘 영업중!{hours_txt}</span>"
+                )
             if req and req.need_no_stairs:
                 popup_rows.append(f"계단: {_condition_label(p.stair_status)}")
                 if p.stair_note:
@@ -935,7 +1278,7 @@ def build_map_html(
                     popup_rows.append(
                         f"<small><a href='{p.stair_source}' target='_blank'>자세히 보기</a></small>"
                     )
-            if req and req.need_kid_friendly:
+            if req and _needs_kid_menu_for_place(p, req):
                 popup_rows.append(f"메뉴: {_condition_label(p.menu_status)}")
                 if p.menu_note:
                     popup_rows.append(f"<small>· {p.menu_note}</small>")

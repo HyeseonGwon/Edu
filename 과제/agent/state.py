@@ -36,7 +36,7 @@ class TripRequirements(BaseModel):
     region: str = Field(default="", description="어디로 가는지 = 검색 대상 지역 (예: 서울 송파구, 강남 일대)")
     menu: str = Field(
         default="",
-        description="원하는 음식/메뉴 (식당일 때만 의미 있는 '선택' 조건, 예: 삼겹살·파스타·국밥). 없으면 빈 문자열",
+        description="원하는 음식/메뉴 (식당·식당+숙소일 때만 의미 있는 '선택' 조건, 예: 삼겹살·파스타·국밥). 없으면 빈 문자열",
     )
 
     # ↓ 심층 검증에서 실제로 확인할 '2가지 핵심 가변 메타데이터' 스위치
@@ -46,7 +46,10 @@ class TripRequirements(BaseModel):
     )
     need_kid_friendly: bool = Field(
         default=False,
-        description="어린이 메뉴 또는 안 매운 메뉴가 필요한지 여부 (아이 동반 시 True)",
+        description=(
+            "어린이 메뉴 또는 안 매운 메뉴가 필요한지 여부. "
+            "아이 동반 + 식당(또는 식당+숙소) 검색일 때만 True. 숙소만 찾을 때는 항상 False."
+        ),
     )
     extra_notes: str = Field(default="", description="기타 요청사항 (주차, 예산, 룸 유무 등)")
 
@@ -82,6 +85,16 @@ class Place(BaseModel):
     )
     menu_note: str = Field(default="", description="메뉴 판정 근거 요약")
     menu_source: str = Field(default="", description="메뉴 정보를 확인한 대표 출처 URL('자세히 보기')")
+
+    # --- 오늘 영업/휴무 검증 단계에서 채워지는 결과 ---
+    #  카카오 '장소 상세'(place_url)의 영업시간/휴무 텍스트를 LLM 이 읽고 오늘 상태를 판정합니다.
+    #  - open_today='closed' 는 '하드 컷' 조건: 오늘 휴무면 최종 결과에서 제외합니다.
+    #  - 'open' 이면 '오늘 영업중!' 배지를 붙이고, 'unknown' 이면 결과에는 올리되 배지는 없습니다.
+    place_url: str = Field(default="", description="카카오 장소 상세 페이지 URL(영업시간/휴무 출처)")
+    open_today: Literal["open", "closed", "unknown"] = Field(
+        default="unknown", description="오늘 영업 여부 (open=영업중, closed=휴무, unknown=알 수 없음)"
+    )
+    today_hours: str = Field(default="", description="오늘 영업시간 텍스트(예: '11:00~21:00'). 모르면 빈 값")
     passed: bool = Field(default=False, description="최종 통과 여부")
 
     # --- 지도 생성 단계에서 채워지는 좌표/표시 여부 ---

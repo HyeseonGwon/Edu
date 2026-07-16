@@ -7,8 +7,9 @@ tools.py
 1) web_search_raw     : DuckDuckGo 로 일반 웹 검색 → 파이썬 리스트[dict] 반환 (후보군 탐색용)
 2) targeted_review_search : "식당명 + 조건 + site:blog.naver.com" 형태의 타겟 검색 → 개별 리뷰 결과 리스트[{title,body,href}] 반환 (심층 검증용)
 3) geocode_place      : 장소명/주소 → 위경도 (실패 시 지역 중심으로 '폴백') — 지도 중심 잡기용
-4) locate_place       : 장소를 '지역 반경 안에서 확실히' 찾을 때만 좌표 반환(아니면 None) — 정확한 핀용
-                        (KAKAO_REST_API_KEY 가 있으면 카카오 로컬 검색으로 정확도↑, 없으면 Nominatim)
+4) locate_place(_info): 장소를 '지역 반경 안에서 확실히' 찾을 때만 좌표/상세 반환(아니면 None) — 정확한 핀용
+                        (KAKAO_REST_API_KEY 가 있으면 카카오 로컬 검색으로 정확도↑ + place_url 확보, 없으면 Nominatim)
+5) fetch_place_hours_text : 카카오 장소 상세(place_url/id)에서 영업시간·휴무 텍스트를 긁어옴 — '오늘 영업 여부' 판정용
 
 지도 핀 정확도 (개선 포인트)
 --------------------------
@@ -31,6 +32,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import time
 
 import requests
@@ -314,7 +316,9 @@ def _kakao_lookup(query: str, center: tuple[float, float] | None, radius_m: int)
     """카카오 로컬 '키워드 검색'. KAKAO_REST_API_KEY 가 있을 때만 동작.
 
     - center + radius 를 주면 '그 반경 안'의 결과를 거리순으로 돌려줍니다(지역 필터 자동).
-    - 반환: {'lat','lng','name','address'} 또는 None.
+    - 반환: {'lat','lng','name','address','place_url','id'} 또는 None.
+      · place_url : 카카오맵 '장소 상세' 페이지 URL (영업시간·휴무·메뉴가 담겨 있음)
+      · id        : 그 장소의 고유 번호 (상세 정보 JSON 을 부를 때 사용)
     ※ 어떤 경우에도 예외를 던지지 않습니다.
     """
     key = os.getenv("KAKAO_REST_API_KEY")
@@ -337,9 +341,58 @@ def _kakao_lookup(query: str, center: tuple[float, float] | None, radius_m: int)
                     "lng": float(d["x"]),
                     "name": d.get("place_name", ""),
                     "address": d.get("road_address_name") or d.get("address_name", ""),
+                    # ↓ 영업시간/휴무 조회에 쓸 '장소 상세' 링크와 고유 id
+                    "place_url": d.get("place_url", ""),
+                    "id": str(d.get("id", "")),
                 }
     except Exception:
         pass
+    return None
+
+
+def locate_place_info(
+    name: str,
+    address: str,
+    region: str,
+    center: tuple[float, float] | None,
+    radius_km: float = 3.0,
+) -> dict | None:
+    """장소를 '지역 중심 반경 안에서 확실히' 찾았을 때만 상세 dict 를 돌려준다.
+
+    반환 dict: {'lat','lng','name','address','place_url','id'}
+      - 카카오 경로에서는 place_url/id 가 채워져(영업시간·휴무 조회 가능),
+        Nominatim 폴백 경로에서는 좌표만 있고 place_url/id 는 빈 값입니다.
+      - 확실히 못 찾으면 None (→ 핀 생략).
+
+    처리 순서:
+        1) (KAKAO_REST_API_KEY 있으면) 카카오 로컬 키워드 검색 — 지역 반경으로 필터.
+           이름만으로 못 찾으면 '지역+이름'으로 한 번 더 시도.
+        2) 카카오 키가 없으면 Nominatim exact → 좌표가 지역 반경 안이면 채택.
+        3) 위 모두 실패하면 None.
+    """
+    radius_m = int(radius_km * 1000)
+
+    # 1) 카카오 (있을 때) — center 반경으로 검색하므로 그 자체가 '지역 안' 보장
+    if os.getenv("KAKAO_REST_API_KEY"):
+        for q in (name, f"{region} {name}"):
+            res = _kakao_lookup(q, center=center, radius_m=radius_m)
+            if res:
+                return res
+        return None  # 카카오로도 지역 반경 안에서 못 찾음 → 핀 없음
+
+    # 2) Nominatim exact (폴백) — 찾더라도 지역 반경 밖이면 '다른 지역'으로 보고 버림
+    query = ", ".join(x for x in [name, address, region, "대한민국"] if x)
+    coords = geocode_exact(query)
+    if coords and center is not None and haversine_km(coords, center) <= radius_km:
+        # 폴백 경로에는 카카오 상세 링크가 없으므로 place_url/id 는 빈 값
+        return {
+            "lat": coords[0],
+            "lng": coords[1],
+            "name": "",
+            "address": address,
+            "place_url": "",
+            "id": "",
+        }
     return None
 
 
@@ -350,27 +403,97 @@ def locate_place(
     center: tuple[float, float] | None,
     radius_km: float = 3.0,
 ) -> tuple[float, float] | None:
-    """장소를 '지역 중심 반경 안에서 확실히' 찾았을 때만 (위도, 경도)를 돌려준다.
+    """locate_place_info 의 좌표만 필요할 때 쓰는 얇은 래퍼. (핀 좌표용)"""
+    info = locate_place_info(name, address, region, center, radius_km)
+    return (info["lat"], info["lng"]) if info else None
 
-    처리 순서:
-        1) (KAKAO_REST_API_KEY 있으면) 카카오 로컬 키워드 검색 — 지역 반경으로 필터.
-           이름만으로 못 찾으면 '지역+이름'으로 한 번 더 시도.
-        2) 카카오 키가 없으면 Nominatim exact → 좌표가 지역 반경 안이면 채택.
-        3) 위 모두 실패하면 None(→ 핀 생략).
+
+# ──────────────────────────────────────────────────────────────────────────
+# 5) 카카오 '장소 상세'에서 영업시간/휴무 텍스트 긁어오기
+#  - 카카오 로컬 검색이 준 place_url/id 로 상세 정보를 가져옵니다.
+#  - 카카오맵 웹이 실제로 쓰는 내부 JSON(place-api.map.kakao.com/places/panel3/{id})을 씁니다.
+#    이 응답의 open_hours 안에는 '오늘(7/16 목)' 요일이 하이라이트된 주간 영업시간/휴무가 담겨,
+#    영업시간·휴무 판단에 딱 맞습니다. (상세 페이지 자체는 SPA라 HTML만으론 제목만 나옴)
+#  - 반환은 open_hours 부분을 직렬화한 '가공 최소 텍스트'입니다. 오늘 영업/휴무 판단은
+#    상위(nodes.check_open_today)의 LLM 이 맡습니다. (스키마가 바뀌어도 견디도록 파싱 최소화)
+#  ※ 이 데이터는 카카오맵 서비스 내부용이므로, 데모/학습 목적 조회로만 사용합니다.
+# ──────────────────────────────────────────────────────────────────────────
+_KAKAO_PANEL_URL = "https://place-api.map.kakao.com/places/panel3/{id}"
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+)
+
+
+def _place_id_from_url(place_url: str) -> str:
+    """place_url(예: https://place.map.kakao.com/1234567) 끝의 숫자 id 를 뽑아낸다."""
+    try:
+        tail = (place_url or "").rstrip("/").split("/")[-1]
+        return tail if tail.isdigit() else ""
+    except Exception:
+        return ""
+
+
+def fetch_place_hours_text(place_url: str, place_id: str = "", max_chars: int = 3500) -> str:
+    """카카오 장소 상세에서 '오늘 영업시간/휴무' 판단에 쓸 텍스트를 긁어 온다.
+
+    처리 순서(모두 실패해도 예외 없이 빈 문자열 반환 — 시연 안정성):
+        1) 카카오 패널 JSON(place-api.map.kakao.com/places/panel3/{id}) 호출
+           → 응답의 open_hours(주간 영업시간·오늘 하이라이트·휴무일)만 추려 직렬화.
+             영업시간 정보 자체가 없으면 "" 를 돌려 상위에서 '알 수 없음' 처리하게 함.
+        2) 패널 JSON 이 실패하면 place_url HTML 폴백(대개 제목만 나오지만 최후의 보루).
+        3) 둘 다 실패하면 빈 문자열.
+
+    Args:
+        place_url: 카카오 장소 상세 페이지 URL.
+        place_id : 장소 고유 id (없으면 place_url 에서 추출 시도).
+        max_chars: LLM 토큰 절약을 위해 잘라낼 최대 길이.
+
+    Returns:
+        영업시간 판단에 쓸 텍스트(길이 제한). 없으면 "".
     """
-    radius_m = int(radius_km * 1000)
+    pid = place_id or _place_id_from_url(place_url)
 
-    # 1) 카카오 (있을 때) — center 반경으로 검색하므로 그 자체가 '지역 안' 보장
-    if os.getenv("KAKAO_REST_API_KEY"):
-        for q in (name, f"{region} {name}"):
-            res = _kakao_lookup(q, center=center, radius_m=radius_m)
-            if res:
-                return (res["lat"], res["lng"])
-        return None  # 카카오로도 지역 반경 안에서 못 찾음 → 핀 없음
+    # 1) 카카오 패널 JSON (브라우저 유사 헤더가 없으면 406 이 나므로 헤더를 정확히 맞춥니다)
+    if pid:
+        try:
+            headers = {
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "ko-KR",
+                "Origin": "https://place.map.kakao.com",
+                "Referer": "https://place.map.kakao.com/",
+                "Pf": "web",  # 카카오맵 웹 클라이언트 식별용
+                "User-Agent": _BROWSER_UA,
+            }
+            resp = requests.get(_KAKAO_PANEL_URL.format(id=pid), headers=headers, timeout=6)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, dict):
+                    # open_hours 안에 headline(현재상태)·week_from_today(요일별 영업/휴무)가 있습니다.
+                    #  오늘 요일은 is_highlight=true 로 표시되어 LLM 이 바로 집어낼 수 있습니다.
+                    oh = data.get("open_hours")
+                    if oh:
+                        blob = json.dumps(oh, ensure_ascii=False)
+                        if blob and blob not in ("null", "{}", "[]"):
+                            return blob[:max_chars]
+                    # 영업시간 정보 자체가 없는 곳(→ 알 수 없음 처리) : LLM 호출을 아끼려 "" 반환
+                    return ""
+        except Exception:
+            pass
 
-    # 2) Nominatim exact (폴백) — 찾더라도 지역 반경 밖이면 '다른 지역'으로 보고 버림
-    query = ", ".join(x for x in [name, address, region, "대한민국"] if x)
-    coords = geocode_exact(query)
-    if coords and center is not None and haversine_km(coords, center) <= radius_km:
-        return coords
-    return None
+    # 2) HTML 폴백 — 태그를 지운 본문 텍스트 (SPA라 제목만 나올 수 있음)
+    if place_url:
+        try:
+            resp = requests.get(place_url, headers={"User-Agent": _BROWSER_UA}, timeout=6)
+            if resp.status_code == 200:
+                html = resp.text
+                html = re.sub(r"<script.*?</script>", " ", html, flags=re.S | re.I)
+                html = re.sub(r"<style.*?</style>", " ", html, flags=re.S | re.I)
+                text = re.sub(r"<[^>]+>", " ", html)
+                text = re.sub(r"\s+", " ", text).strip()
+                if text:
+                    return text[:max_chars]
+        except Exception:
+            pass
+
+    return ""

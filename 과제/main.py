@@ -24,6 +24,7 @@ LangGraph 에이전트를 HTTP API 로 노출하는 FastAPI 서버입니다.
 from __future__ import annotations
 
 import json
+import os
 import queue
 import threading
 import uuid
@@ -43,6 +44,7 @@ from agent.nodes import (
     reset_progress_sink,
     search_candidates,
     set_progress_sink,
+    sort_finalists,
     validate_place,
 )
 from agent.state import FamilyTripState, Place, TripRequirements
@@ -180,8 +182,17 @@ def _error_payload(session: SessionData, session_id: str) -> dict:
 # ──────────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
-    """서버가 살아있는지 확인하는 헬스체크."""
-    return {"ok": True, "sessions": len(SESSIONS)}
+    """서버 상태 + Kakao Local API 연결 여부를 확인하는 헬스체크.
+
+    - kakao=True  : KAKAO_REST_API_KEY 가 설정되어 정밀 지오코딩·폐업/휴무 필터가 동작.
+    - kakao=False : 무료 폴백(Nominatim)만 사용 → 위치 핀 정확도↓, 폐업/오늘 휴무 업체가
+      결과에 포함될 수 있음(프런트가 이 값을 받아 사이드바 배너로 안내).
+    """
+    return {
+        "ok": True,
+        "sessions": len(SESSIONS),
+        "kakao": bool(os.getenv("KAKAO_REST_API_KEY")),
+    }
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -415,12 +426,15 @@ def search_step(req: StepRequest):
             return
 
         # 조건을 '모두' 통과했으면 즉시 최종 목록에 추가 (이름 중복 방지)
+        #  추가 후 '오늘 영업중' > '메뉴 일치' 순으로 재정렬해, 나중에 찾은 영업중이 위로 오게 함
         added = False
         if place.passed:
             existing = {p.name for p in session.search_finalists}
             if place.name not in existing:
                 session.search_finalists.append(place)
-                session.search_finalists = session.search_finalists[:TARGET_FINALISTS]
+                session.search_finalists = sort_finalists(session.search_finalists)[
+                    :TARGET_FINALISTS
+                ]
                 added = True
                 # 새로 추가됐을 때만 지도를 다시 그림 (기존 핀 좌표는 캐시 재사용)
                 session.map_html = build_map_html(
